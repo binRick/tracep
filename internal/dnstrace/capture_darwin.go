@@ -146,30 +146,46 @@ func openCapture() (*darwinCapture, error) {
 // bpfWordAlign rounds up to the BPF alignment (sizeof(int32)=4 on macOS).
 func bpfWordAlign(x int) int { return (x + 3) &^ 3 }
 
+// bpfNextRecord splits the first bpf_hdr-framed record out of rec. macOS
+// struct bpf_hdr is: bh_tstamp[0:8], bh_caplen[8:12], bh_datalen[12:16],
+// bh_hdrlen[16:18] (host byte order). bh_hdrlen is the (aligned) offset to
+// the captured frame; the next record starts at BPF_WORDALIGN(hdrlen+caplen).
+// Returns the frame, the remaining buffer, and ok=false when no complete
+// record is present (caller should read more / resync).
+//
+// Pure and unit-tested (capture_darwin_test.go) because the framing math is
+// the most error-prone part and can't be exercised without root + /dev/bpf.
+func bpfNextRecord(rec []byte) (frame, rest []byte, ok bool) {
+	if len(rec) < 18 { // 18 = nominal sizeof(struct bpf_hdr)
+		return nil, nil, false
+	}
+	caplen := int(binary.LittleEndian.Uint32(rec[8:12]))
+	hdrlen := int(binary.LittleEndian.Uint16(rec[16:18]))
+	if hdrlen < 18 || caplen < 0 || hdrlen+caplen > len(rec) {
+		return nil, nil, false
+	}
+	frame = rec[hdrlen : hdrlen+caplen]
+	advance := bpfWordAlign(hdrlen + caplen)
+	if advance >= len(rec) {
+		rest = nil
+	} else {
+		rest = rec[advance:]
+	}
+	return frame, rest, true
+}
+
 // next returns the next captured Ethernet frame, refilling from the BPF
 // device when the current read buffer is exhausted. One read() can carry
 // many bpf_hdr-prefixed records.
 func (c *darwinCapture) next() ([]byte, error) {
 	for {
-		// Parse the next record out of whatever we already read.
-		for len(c.rec) >= 18 { // 18 = nominal sizeof(struct bpf_hdr)
-			caplen := int(binary.LittleEndian.Uint32(c.rec[8:12]))
-			hdrlen := int(binary.LittleEndian.Uint16(c.rec[16:18]))
-			if hdrlen < 18 || hdrlen+caplen > len(c.rec) {
-				c.rec = nil // malformed / truncated — resync on next read
-				break
-			}
-			frame := c.rec[hdrlen : hdrlen+caplen]
-			advance := bpfWordAlign(hdrlen + caplen)
-			if advance >= len(c.rec) {
-				c.rec = nil
-			} else {
-				c.rec = c.rec[advance:]
-			}
+		if frame, rest, ok := bpfNextRecord(c.rec); ok {
+			c.rec = rest
 			out := make([]byte, len(frame))
 			copy(out, frame)
 			return out, nil
 		}
+		c.rec = nil // exhausted or malformed — resync on next read
 
 		n, err := syscall.Read(c.fd, c.buf)
 		if err != nil {

@@ -162,6 +162,13 @@ TRACEP=/usr/local/bin/tracep test/run.sh 02 05    # only the ca + dns suites
 check fails. `lib.sh` provides the assertions; `lib_live.sh` drives the
 root-only tracers.
 
+In addition, `make unit` runs Go unit tests. The macOS BPF record-framing
+(`bpf_hdr` offsets + `BPF_WORDALIGN` between records) is the most
+error-prone part of the platform code and cannot be exercised without
+root + `/dev/bpf`, so it is covered deterministically by
+`capture_darwin_test.go` (single/aligned-header/multi-record-with-padding/
+exact-fit/malformed cases).
+
 ### Test cases — what each one does and what tracep detects
 
 Every suite is a black-box test: it drives the real binary, generates

@@ -32,6 +32,9 @@ vet:
 	GOOS=linux  go vet ./...
 	GOOS=darwin go vet ./...
 
+unit:
+	go test ./...
+
 test:
 	TRACEP=$(TRACEP) bash test/run.sh
 
