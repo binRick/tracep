@@ -1,3 +1,5 @@
+//go:build linux
+
 // proc-trace-tls — capture plaintext TLS traffic via ftrace uprobes on OpenSSL/GnuTLS
 //
 // Attaches uprobes to SSL_read / SSL_write (and their _ex variants) in libssl.so

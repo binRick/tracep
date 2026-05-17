@@ -1,3 +1,5 @@
+//go:build linux
+
 // proc-trace-exec — trace exec() calls system-wide via Linux proc connector
 //
 // Requires CONFIG_CONNECTOR=y and CONFIG_PROC_EVENTS=y

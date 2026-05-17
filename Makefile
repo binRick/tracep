@@ -11,7 +11,7 @@ LDFLAGS := -s -w \
   -X $(PKG)/internal/exectrace.version=$(VERSION) \
   -X $(PKG)/internal/cafetch.version=$(VERSION)
 
-.PHONY: all linux vet test release clean
+.PHONY: all linux darwin vet test release clean
 
 all:
 	go build -ldflags "$(LDFLAGS)" -o $(BIN) .
@@ -21,20 +21,28 @@ linux:
 	GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BIN)-linux-amd64 .
 	GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BIN)-linux-arm64 .
 
+# macOS binaries: `ca` + `dns` (BPF) work natively; net/tls/exec print a
+# clear Linux-only message.
+darwin:
+	mkdir -p dist
+	GOOS=darwin GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BIN)-darwin-amd64 .
+	GOOS=darwin GOARCH=arm64 go build -trimpath -ldflags "$(LDFLAGS)" -o dist/$(BIN)-darwin-arm64 .
+
 vet:
-	GOOS=linux go vet ./...
+	GOOS=linux  go vet ./...
+	GOOS=darwin go vet ./...
 
 test:
 	TRACEP=$(TRACEP) bash test/run.sh
 
-# release: versioned linux binaries + RPMs (amd64/arm64) + checksums in dist/
-release: linux
+# release: versioned linux+darwin binaries + RPMs (amd64/arm64) + checksums
+release: linux darwin
 	cp dist/$(BIN)-linux-amd64 dist/tracep.staged
 	VERSION=$(VERSION) NFPM_ARCH=amd64 nfpm package -f nfpm.yaml -p rpm -t dist/
 	cp dist/$(BIN)-linux-arm64 dist/tracep.staged
 	VERSION=$(VERSION) NFPM_ARCH=arm64 nfpm package -f nfpm.yaml -p rpm -t dist/
 	rm -f dist/tracep.staged
-	cd dist && shasum -a 256 $(BIN)-linux-* *.rpm > SHA256SUMS
+	cd dist && shasum -a 256 $(BIN)-linux-* $(BIN)-darwin-* *.rpm > SHA256SUMS
 
 clean:
 	rm -rf $(BIN) dist

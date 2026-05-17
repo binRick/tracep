@@ -3,15 +3,20 @@
 Trace a process's network, TLS, DNS, and exec activity — one self-contained Go binary.
 
 `tracep` unifies five previously-separate tools into a single zero-dependency
-(stdlib-only) Linux binary with a subcommand per tracer:
+(stdlib-only) binary with a subcommand per tracer:
 
-| Command | What it traces | Mechanism |
-|---|---|---|
-| `tracep net`  | per-process network connections | netlink socket diag + `/proc` |
-| `tracep tls`  | per-process TLS reads/writes & SNI | `libssl` uprobes |
-| `tracep dns`  | per-process DNS queries & answers | raw `AF_PACKET` socket |
-| `tracep exec` | per-process `exec()` syscalls | netlink proc connector |
-| `tracep ca`   | a host's TLS CA certificate chain | outbound TLS dial |
+| Command | What it traces | Mechanism | Linux | macOS |
+|---|---|---|:--:|:--:|
+| `tracep net`  | per-process network connections | netlink socket diag + `/proc` | ✅ | ❌ |
+| `tracep tls`  | per-process TLS reads/writes & SNI | `libssl` uprobes | ✅ | ❌ |
+| `tracep dns`  | per-process DNS queries & answers | `AF_PACKET` (Linux) / BPF (macOS) | ✅ | ✅¹ |
+| `tracep exec` | per-process `exec()` syscalls | netlink proc connector | ✅ | ❌ |
+| `tracep ca`   | a host's TLS CA certificate chain | outbound TLS dial | ✅ | ✅ |
+
+¹ macOS `dns` captures via `/dev/bpf` and shows queries **without** process
+attribution (pid `0`, name `?`) — there is no portable socket→PID map off
+Linux. On macOS, `net`/`tls`/`exec` exit immediately with a clear
+"Linux-only" message; the binary still builds and runs everywhere.
 
 Each subcommand keeps the exact flags and behaviour of its original
 `proc-trace-*` / `tls-ca-fetch` tool — run `tracep <command> -h` for details.
@@ -21,10 +26,13 @@ Each subcommand keeps the exact flags and behaviour of its original
 ```sh
 make            # build ./tracep for the host
 make linux      # cross-compile static linux/amd64 + linux/arm64 into dist/
+make darwin     # cross-compile macOS amd64 + arm64 into dist/
 ```
 
-`tracep` uses raw `syscall` netlink/AF_PACKET and `/proc` parsing, so the
-tracers **run on Linux only**. It cross-compiles from any platform.
+The binary builds and runs on Linux and macOS. The Linux-only tracers
+(`net`/`tls`/`exec`) are gated behind `//go:build linux`; on macOS they
+are present but exit with a Linux-only message, while `ca` and `dns`
+(BPF) work natively. It cross-compiles from any platform.
 
 ## Usage
 
@@ -34,9 +42,13 @@ sudo tracep dns -p 1234      # DNS queries from PID 1234 only
 sudo tracep dns -j | jq .    # DNS as line-delimited JSON
 sudo tracep exec             # every exec() across the system
 tracep ca example.com -o -   # dump example.com's CA chain as PEM
+
+sudo tracep dns              # macOS: same, via /dev/bpf (no PID column)
+tracep ca example.com        # macOS: works natively, no privileges
 ```
 
-The four live tracers need root (`CAP_NET_RAW` / `CAP_NET_ADMIN`); `ca` does not.
+The live tracers need root (`CAP_NET_RAW` / `CAP_NET_ADMIN` on Linux,
+`/dev/bpf` access on macOS); `ca` needs no privileges on any platform.
 
 ## What each tracer finds — in detail
 
@@ -236,11 +248,20 @@ The four live tracers are timing-sensitive (they race tracer startup
 against generated traffic, and `tls` needs ~2 s to arm its uprobes).
 `lib_live.sh` waits for the probes to attach and retries a capture up to
 three times before failing, so the suite is deterministic without masking
-a genuinely broken tracer. On non-root or non-Linux hosts the live suites
-**skip** (not fail) with a clear message; `01_dispatch` and `02_ca` run
-anywhere.
+a genuinely broken tracer.
 
-Latest run: **54/54 checks green** on Linux 6.12 x86-64.
+The suite is OS-aware:
+
+- **Linux** — all six suites run; the four live tracers need root (skip,
+  don't fail, otherwise).
+- **macOS** — `01_dispatch` and `02_ca` run fully; `net`/`tls`/`exec`
+  switch to a **stub assertion** (must exit non-zero with the Linux-only
+  message); `05_dns` runs its `-h` regression everywhere and its live
+  BPF capture when run as root (skips otherwise).
+- Other OSes — live suites skip with a clear message.
+
+Latest runs: **54/54 green** on Linux 6.12 x86-64; **43/43 green** on
+macOS (arm64, unprivileged — dns BPF capture skipped without root).
 
 ## Origin
 

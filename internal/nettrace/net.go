@@ -1,3 +1,5 @@
+//go:build linux
+
 // proc-trace-net — trace network connections system-wide via Linux conntrack netlink
 //
 // Requires CONFIG_NF_CONNTRACK=y (nf_conntrack module, standard on any Linux running Docker)

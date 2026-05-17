@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
-# Helpers for the live (root + Linux) tracer tests.
+# Helpers for the live tracer tests (root; Linux AF_PACKET or macOS BPF).
 # These tracers run continuously; we bound them with `timeout`, generate
 # matching traffic in the middle of the window, then inspect the capture.
 
-is_root()  { [ "$(id -u)" = 0 ]; }
-is_linux() { [ "$(uname -s)" = Linux ]; }
+is_root()   { [ "$(id -u)" = 0 ]; }
+is_linux()  { [ "$(uname -s)" = Linux ]; }
+is_darwin() { [ "$(uname -s)" = Darwin ]; }
+
+# assert_stub <subcommand> — on non-Linux, net/tls/exec must refuse
+# cleanly: non-zero exit and a clear "only supported on Linux" message.
+assert_stub() {
+  local sub="$1"
+  local o; o="$("$TRACEP" "$sub" 2>&1)"; local rc=$?
+  if [ "$rc" = 0 ]; then _fail "$sub: stub exits non-zero off Linux" "exit was 0"
+  else _pass "$sub: stub exits non-zero off Linux"; fi
+  assert_contains "$sub: stub explains Linux-only" "only supported on Linux" "$o"
+  assert_not_contains "$sub: stub does not panic" "panic:" "$o"
+}
 
 # generators — each produces activity the matching tracer should observe
 gen_dns() {
@@ -17,12 +29,13 @@ gen_tls() { curl -s -m 6 -o /dev/null https://example.com 2>/dev/null; }
 gen_exec() { for i in 1 2 3 4 5; do /bin/true; /usr/bin/uname -a >/dev/null; done; }
 
 # live_test <label> <gen-fn> <expect-regex> -- <tracep subcmd + args...>
-#   Skips (not fails) when not root/Linux. Fails on panic, empty output,
-#   or a fatal privilege/socket error while running as root.
+#   Runs on Linux (AF_PACKET) and macOS (BPF). Skips (not fails) when not
+#   root or on an unsupported OS. Fails on panic, empty output, or a fatal
+#   privilege/socket error while running as root.
 live_test() {
   local label="$1" gen="$2" expect="$3"; shift 4
-  if ! is_linux; then echo "${C_Y}skip${C_0} $label (not Linux)"; return 0; fi
-  if ! is_root;  then echo "${C_Y}skip${C_0} $label (needs root)"; return 0; fi
+  if ! is_linux && ! is_darwin; then echo "${C_Y}skip${C_0} $label (unsupported OS)"; return 0; fi
+  if ! is_root; then echo "${C_Y}skip${C_0} $label (needs root)"; return 0; fi
 
   # Live syscall/network tracing is timing-sensitive: a single capture can
   # race tracer startup against traffic generation. Retry up to 3 times and

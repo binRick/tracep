@@ -18,7 +18,6 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"unsafe"
 )
 
 var version = "dev"
@@ -146,12 +145,14 @@ func Main() {
 		}
 	}
 
-	// Raw AF_PACKET socket — captures all frames on all interfaces.
-	fd, err := syscall.Socket(syscall.AF_PACKET, syscall.SOCK_RAW, int(htons(syscall.ETH_P_ALL)))
+	// Open the platform packet-capture device (Linux AF_PACKET socket /
+	// macOS /dev/bpf). openCapture is implemented in capture_<os>.go and
+	// returns a descriptive error (including the privilege hint) on failure.
+	cap, err := openCapture()
 	if err != nil {
-		die("socket: %v\nHint: run as root or: sudo setcap cap_net_raw+eip proc-trace-dns", err)
+		die("%v", err)
 	}
-	defer syscall.Close(fd)
+	defer cap.Close()
 
 	proc := newProcCache()
 
@@ -180,17 +181,16 @@ func Main() {
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sigs; os.Exit(0) }()
 
-	buf := make([]byte, 65536)
 	for {
-		n, _, err := syscall.Recvfrom(fd, buf, 0)
+		pkt, err := cap.next()
 		if err != nil {
 			if !*fQQuiet {
-				logErr("recvfrom: %v", err)
+				logErr("capture: %v", err)
 			}
 			continue
 		}
 
-		msg, srcPort, dstPort, ok := parseDNSFromPacket(buf[:n])
+		msg, srcPort, dstPort, ok := parseDNSFromPacket(pkt)
 		if !ok {
 			continue
 		}
@@ -400,13 +400,19 @@ func logErr(format string, args ...interface{}) {
 	fmt.Fprintf(os.Stderr, format+"\n", args...)
 }
 
-// htons converts a uint16 from host to network byte order.
-func htons(v uint16) uint16 { return (v << 8) | (v >> 8) }
-
-// isatty returns true when fd refers to a terminal.
+// isatty reports whether the given std fd (1=stdout, 2=stderr) is a
+// terminal. Portable: checks the character-device mode bit instead of a
+// platform-specific TCGETS ioctl.
 func isatty(fd int) bool {
-	var t syscall.Termios
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd),
-		syscall.TCGETS, uintptr(unsafe.Pointer(&t)))
-	return errno == 0
+	var f *os.File
+	switch fd {
+	case 1:
+		f = os.Stdout
+	case 2:
+		f = os.Stderr
+	default:
+		return false
+	}
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }
