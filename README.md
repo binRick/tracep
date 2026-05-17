@@ -150,16 +150,85 @@ TRACEP=/usr/local/bin/tracep test/run.sh 02 05    # only the ca + dns suites
 check fails. `lib.sh` provides the assertions; `lib_live.sh` drives the
 root-only tracers.
 
-### Test cases
+### Test cases — what each one does and what tracep detects
 
-| Suite | What it verifies |
+Every suite is a black-box test: it drives the real binary, generates
+known activity, and asserts on what tracep reports back. The live suites
+(`03`–`06`) run a tracer under a `timeout`, generate matching traffic
+mid-window, then inspect the capture.
+
+#### `01_dispatch` — command routing (no privileges, runs anywhere)
+
+The dispatcher itself does no tracing, so these cases verify the merge
+plumbing rather than a tracer.
+
+| Test action | What is asserted |
 |---|---|
-| `01_dispatch` | No-args exits 2 with usage; `-h/--help/help` exit 0 and list every subcommand; `-v/--version/version` print the name; an unknown command exits 2 and is named; **all five subcommands are routable** (regression for the dispatcher). |
-| `02_ca` | No-host exits 1 with usage; `-version` prints a version; **flags after the hostname are accepted** (`ca github.com -o -` — regression for the arg-permute fix); a live fetch of `github.com` emits a valid `BEGIN/END CERTIFICATE` block; `-o FILE` writes that PEM to disk; a bad host fails cleanly without hanging or panicking. |
-| `03_net` | As root: tracer starts without a privilege error, captures generated `curl` traffic, and never panics. |
-| `04_tls` | As root: a **real captured handshake event** (`SSL_write`/`SSL_read` or the SNI host) is observed — not merely the startup banner. |
-| `05_dns` | `dns -h` does **not** panic with `flag redefined` (regression for the global-flag-collision bug found during the merge); usage renders; live queries are captured in both human and `-j` JSON form. |
-| `06_exec` | As root: generated `exec()`s (`/bin/true`, `uname`, …) appear in the stream. |
+| Run `tracep` with no args | Exits **2** and prints the `commands:` usage block |
+| Run `tracep -h`, `--help`, `help` | Each exits **0** and lists every subcommand (e.g. `trace per-process DNS queries`) |
+| Run `tracep -v`, `--version`, `version` | Each exits **0** and prints `tracep` + the build version |
+| Run `tracep bogus` | Exits **2** and the message names the bad command: `unknown command "bogus"` |
+| Run `tracep <sub> -h` for net/tls/dns/exec/ca | None reports `unknown command` → **all five tracers are reachable** (regression: a broken dispatch entry would silently lose a tracer) |
+
+#### `02_ca` — TLS CA chain fetch (no privileges, runs anywhere)
+
+Stimulus is an outbound TLS dial; tracep must extract the server's
+certificate chain.
+
+| Test action | What tracep detects / asserts |
+|---|---|
+| `tracep ca` (no hostname) | Exits **1**, usage mentions `hostname` |
+| `tracep ca -version` | Exits **0**, prints a `ca-fetch v0.x` version |
+| `tracep ca github.com -o -` | **Flag after positional is accepted** (regression for the arg-permute bug — previously misread `-o` as the port) |
+| `tracep ca github.com -o -` (live) | Output contains a real `-----BEGIN CERTIFICATE-----` … `END CERTIFICATE-----` block — tracep parsed github.com's served chain |
+| `tracep ca github.com -o /tmp/gh-ca.pem` | The PEM is written to the file on disk |
+| `tracep ca no-such-host.invalid -timeout 3` | Fails with non-zero exit **without hanging or panicking** (clean error path) |
+
+If outbound 443 is unavailable the live fetch *skips* (not fails) with a
+clear message.
+
+#### `03_net` — connection attribution (root + Linux)
+
+The test runs `tracep net`, then generates `curl http://example.com`
+traffic. tracep must observe the connection.
+
+| Test action | What tracep detects / asserts |
+|---|---|
+| Start `tracep net` as root | No `Hint: run as root` socket error → it has the privileges it needs |
+| `curl http://example.com` during the window | Capture is non-empty and contains a matching flow — the `curl` command, `example`, or a `:80`/`:443` endpoint, with its direction arrow (`→`/`←`/`↔`) |
+| Throughout | Output never contains `panic:` |
+
+#### `04_tls` — TLS read/write visibility (root + Linux)
+
+Runs `tracep tls` (which arms `libssl` uprobes — given ~3 s to attach),
+then drives `curl https://example.com`.
+
+| Test action | What tracep detects / asserts |
+|---|---|
+| Start `tracep tls` as root | Attaches probes without a privilege error |
+| `curl https://example.com` during the window | A **real handshake event** is captured — an `SSL_write`/`SSL_read` line or the SNI host (`example`/`github`), e.g. `… curl TX SSL_write example.com`. The startup banner alone is **not** accepted as a pass |
+| Throughout | No `panic:` |
+
+#### `05_dns` — DNS query attribution (root + Linux)
+
+Combines a regression check with live capture.
+
+| Test action | What tracep detects / asserts |
+|---|---|
+| `tracep dns -h` | Does **not** panic with `flag redefined` (regression for the global-`flag` collision found during the merge) and does not `panic:`; the `USAGE` block renders |
+| `dig example.com github.com`, `nslookup cloudflare.com` during the window | Human mode: the queried names / record types appear (`example`, `github`, `cloudflare`, `A`, `AAAA`) |
+| Same, with `tracep dns -j` | JSON mode: output is line-delimited objects (`{… "query": …}`) suitable for `jq` |
+| Throughout | No `panic:` |
+
+#### `06_exec` — program-launch audit (root + Linux)
+
+Runs `tracep exec`, then launches known short-lived processes.
+
+| Test action | What tracep detects / asserts |
+|---|---|
+| Start `tracep exec` as root | Subscribes to the proc connector without a privilege error |
+| Run `/bin/true` and `uname -a` repeatedly | Those `exec()`s appear in the stream (`true`, `uname`, `/bin/`, `/usr/bin/`) — including processes too short-lived for `ps` polling to catch |
+| Throughout | No `panic:` |
 
 ### Notes on reliability
 
