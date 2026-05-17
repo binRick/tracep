@@ -1,0 +1,24 @@
+# nfpm packaging config — produces tracep RPMs.
+# Invoked per-arch by `make release` with NFPM_ARCH / BIN set.
+name: tracep
+arch: ${NFPM_ARCH}
+platform: linux
+version: ${VERSION}
+section: net
+priority: optional
+maintainer: binRick <4857149+binRick@users.noreply.github.com>
+description: |
+  Trace a process's network, TLS, DNS, and exec activity.
+  One self-contained, zero-dependency Linux binary unifying the
+  proc-trace-{net,tls,dns,exec} tracers and a TLS CA fetcher.
+vendor: binRick
+homepage: https://github.com/binRick/tracep
+license: MIT
+contents:
+  - src: dist/tracep.staged
+    dst: /usr/bin/tracep
+    file_info:
+      mode: 0755
+rpm:
+  group: Applications/Internet
+  compression: zstd

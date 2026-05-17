@@ -16,7 +16,9 @@ import (
 	"github.com/binRick/tracep/internal/tlstrace"
 )
 
-const version = "dev"
+// version is overridden at build time via -ldflags "-X main.version=...".
+// It must stay a var (not const) for the linker to patch it.
+var version = "dev"
 
 var subcommands = []struct {
 	name, desc string

@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-const version = "v1.0.0"
+var version = "v1.0.0" // patched via -ldflags -X at release build
 
 func Main() {
 	fs := flag.NewFlagSet("tracep ca", flag.ExitOnError)
