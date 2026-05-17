@@ -17,26 +17,37 @@ import (
 const version = "v1.0.0"
 
 func Main() {
+	fs := flag.NewFlagSet("tracep ca", flag.ExitOnError)
 	var (
-		port       = flag.Int("port", 443, "TLS port to connect to")
-		output     = flag.String("o", "", "Output file (default: <hostname>-ca.pem, use - for stdout)")
-		fetchRoot  = flag.Bool("fetch-root", false, "Fetch root CA via AIA URL")
-		insecure   = flag.Bool("insecure", false, "Skip TLS certificate verification")
-		all        = flag.Bool("all", false, "Save full chain including leaf certificate")
-		timeout    = flag.Int("timeout", 10, "Connection timeout in seconds")
-		showVer    = flag.Bool("version", false, "Print version and exit")
+		port       = fs.Int("port", 443, "TLS port to connect to")
+		output     = fs.String("o", "", "Output file (default: <hostname>-ca.pem, use - for stdout)")
+		fetchRoot  = fs.Bool("fetch-root", false, "Fetch root CA via AIA URL")
+		insecure   = fs.Bool("insecure", false, "Skip TLS certificate verification")
+		all        = fs.Bool("all", false, "Save full chain including leaf certificate")
+		timeout    = fs.Int("timeout", 10, "Connection timeout in seconds")
+		showVer    = fs.Bool("version", false, "Print version and exit")
 	)
-	flag.Parse()
+	// Permute args so flags may appear after positionals
+	// (e.g. `ca github.com -o -`), which plain flag.Parse rejects.
+	var args []string
+	rest := os.Args[1:]
+	for {
+		fs.Parse(rest)
+		if fs.NArg() == 0 {
+			break
+		}
+		args = append(args, fs.Arg(0))
+		rest = fs.Args()[1:]
+	}
 
 	if *showVer {
 		fmt.Println("tls-ca-fetch", version)
 		os.Exit(0)
 	}
 
-	args := flag.Args()
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: tls-ca-fetch [flags] <hostname> [port]")
-		flag.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "usage: tracep ca [flags] <hostname> [port]")
+		fs.PrintDefaults()
 		os.Exit(1)
 	}
 

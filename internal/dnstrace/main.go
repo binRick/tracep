@@ -25,18 +25,21 @@ var version = "dev"
 
 // ── CLI flags ────────────────────────────────────────────────────────────────
 
+// Flag pointers stay package-scoped because dns.go/proc.go/packet.go
+// dereference them, but they are bound to a private FlagSet inside Main()
+// so they never collide with another subcommand's global flags.
 var (
-	fColor  = flag.Bool("c", false, "force ANSI color output")
-	fDomain = flag.String("d", "", "only show queries matching this domain substring")
-	fFlat   = flag.Bool("f", false, "flat output — no column alignment")
-	fJSON   = flag.Bool("j", false, "JSON output (one object per line)")
-	fNames  = flag.String("n", "", "only show queries from these process names (comma-separated)")
-	fOutput = flag.String("o", "", "append output to FILE instead of stdout")
-	fPIDs   = flag.String("p", "", "only show queries from these PIDs (comma-separated)")
-	fQuiet  = flag.Bool("q", false, "quiet — print only queried hostnames, one per line")
-	fQQuiet = flag.Bool("Q", false, "suppress error messages")
-	fTime   = flag.Bool("t", false, "show timestamp (RFC3339) for each query")
-	fTypes  = flag.String("T", "", "only show these DNS record types, e.g. A,AAAA,MX (comma-separated)")
+	fColor  *bool
+	fDomain *string
+	fFlat   *bool
+	fJSON   *bool
+	fNames  *string
+	fOutput *string
+	fPIDs   *string
+	fQuiet  *bool
+	fQQuiet *bool
+	fTime   *bool
+	fTypes  *string
 )
 
 // ── Runtime state ────────────────────────────────────────────────────────────
@@ -52,7 +55,20 @@ var (
 // ── Main ─────────────────────────────────────────────────────────────────────
 
 func Main() {
-	flag.Usage = func() {
+	fs := flag.NewFlagSet("tracep dns", flag.ExitOnError)
+	fColor = fs.Bool("c", false, "force ANSI color output")
+	fDomain = fs.String("d", "", "only show queries matching this domain substring")
+	fFlat = fs.Bool("f", false, "flat output — no column alignment")
+	fJSON = fs.Bool("j", false, "JSON output (one object per line)")
+	fNames = fs.String("n", "", "only show queries from these process names (comma-separated)")
+	fOutput = fs.String("o", "", "append output to FILE instead of stdout")
+	fPIDs = fs.String("p", "", "only show queries from these PIDs (comma-separated)")
+	fQuiet = fs.Bool("q", false, "quiet — print only queried hostnames, one per line")
+	fQQuiet = fs.Bool("Q", false, "suppress error messages")
+	fTime = fs.Bool("t", false, "show timestamp (RFC3339) for each query")
+	fTypes = fs.String("T", "", "only show these DNS record types, e.g. A,AAAA,MX (comma-separated)")
+
+	fs.Usage = func() {
 		// Detect color: respect NO_COLOR, fall back to -c flag or isatty on stderr.
 		color := *fColor || (isatty(2) && os.Getenv("NO_COLOR") == "")
 		h := func(plain, colored string) string {
@@ -110,7 +126,7 @@ func Main() {
 		ex("sudo proc-trace-dns -- curl https://example.com",      "trace a single command")
 		fmt.Fprintf(os.Stderr, "\n%s%sRequires root or CAP_NET_RAW. Linux only.%s\n\n", e("⚠️ "), dim, reset)
 	}
-	flag.Parse()
+	fs.Parse(os.Args[1:])
 
 	nameSet = splitSet(*fNames)
 	typeSet = splitSetUpper(*fTypes)
@@ -143,8 +159,8 @@ func Main() {
 	pending := make(map[uint16]*dnsEvent)
 
 	// If a command was given after --, run it and filter to its PID.
-	if flag.NArg() > 0 {
-		cmd := exec.Command(flag.Arg(0), flag.Args()[1:]...)
+	if fs.NArg() > 0 {
+		cmd := exec.Command(fs.Arg(0), fs.Args()[1:]...)
 		cmd.Stdin = os.Stdin
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
