@@ -1,0 +1,4 @@
+/tracep
+/dist/
+*.test
+*.out
