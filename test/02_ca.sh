@@ -14,7 +14,7 @@ assert_eq 0 "$rc" "ca -version exits 0"
 assert_match "ca -version prints a version" 'ca-fetch v[0-9]' "$o"
 
 # Regression: flags must be accepted *after* positionals (permute).
-o="$(timeout 15s "$TRACEP" ca github.com -o - 2>&1)"; rc=$?
+o="$(run_timeout 15 -- "$TRACEP" ca github.com -o - 2>&1)"; rc=$?
 assert_not_contains "ca accepts flags after hostname (permute)" "invalid port: -o" "$o"
 
 # Live fetch — needs outbound 443. Skip gracefully if no connectivity.
@@ -31,7 +31,7 @@ else
 fi
 
 # bad host should fail, not hang or panic
-o="$(timeout 15s "$TRACEP" ca no-such-host.invalid -timeout 3 2>&1)"; rc=$?
+o="$(run_timeout 15 -- "$TRACEP" ca no-such-host.invalid -timeout 3 2>&1)"; rc=$?
 assert_match "ca bad host fails cleanly" '[1-9]' "$rc"
 assert_not_contains "ca bad host does not panic" "panic:" "$o"
 

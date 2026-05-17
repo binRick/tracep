@@ -41,15 +41,22 @@ live_test() {
   # race tracer startup against traffic generation. Retry up to 3 times and
   # keep the first capture that observed the expected activity, so the suite
   # is deterministic without masking a genuinely broken tracer.
+  # The tracer runs until we stop it — bound the window with background +
+  # signal (NOT GNU `timeout`, which macOS does not ship). tracep handles
+  # SIGTERM and exits cleanly; a delayed SIGKILL is a safety net.
   local out="" attempt
   for attempt in 1 2 3; do
     local of; of="$(mktemp /tmp/tracep-live.XXXXXX)"
-    timeout 10s "$TRACEP" "$@" >"$of" 2>&1 &
+    "$TRACEP" "$@" >"$of" 2>&1 &
     local pid=$!
     sleep 3               # tls attaches libssl uprobes — needs ~2s to arm
     "$gen"; "$gen"        # generate twice in case the first races startup
     sleep 1.5
+    kill -TERM "$pid" 2>/dev/null
+    ( sleep 2; kill -KILL "$pid" 2>/dev/null ) &
+    local killer=$!
     wait "$pid" 2>/dev/null
+    kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null
     out="$(cat "$of")"; rm -f "$of"
     if [ -n "$out" ] && printf '%s' "$out" | grep -qE -- "$expect"; then break; fi
     [ "$attempt" -lt 3 ] && echo "${C_D}     $label: attempt $attempt saw no match, retrying${C_0}"

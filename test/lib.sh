@@ -60,12 +60,26 @@ assert_rc() {
   else _fail "$msg" "expected exit $exp got $rc; output: $(printf '%s' "$o" | head -1)"; fi
 }
 
-# trace_for <seconds> <outfile> -- <tracep args...> : run a live tracer bounded by timeout,
-# capturing stdout+stderr to outfile. Returns immediately after timeout.
-trace_for() {
-  local secs="$1" of="$2"; shift 3
-  timeout "${secs}s" "$TRACEP" "$@" >"$of" 2>&1 &
-  echo $!
+# run_timeout <seconds> -- <cmd...> : run cmd with a wall-clock cap.
+# Uses GNU `timeout`/`gtimeout` when present (Linux), otherwise a portable
+# bash fallback (macOS ships no `timeout`). Returns the command's exit code.
+run_timeout() {
+  local secs="$1"; shift
+  [ "${1:-}" = "--" ] && shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "${secs}s" "$@"; return $?
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "${secs}s" "$@"; return $?
+  fi
+  "$@" &
+  local p=$!
+  ( sleep "$secs"; kill -TERM "$p" 2>/dev/null; sleep 1; kill -KILL "$p" 2>/dev/null ) &
+  local w=$!
+  wait "$p" 2>/dev/null
+  local rc=$?
+  kill "$w" 2>/dev/null
+  wait "$w" 2>/dev/null
+  return $rc
 }
 
 section() { echo; echo "${C_Y}── $* ──${C_0}"; }
