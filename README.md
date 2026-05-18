@@ -24,12 +24,16 @@ Each subcommand keeps the exact flags and behaviour of its original
 ## Build
 
 ```sh
-make            # build ./tracep for the host (Go)
+make            # build ./tracep for the host (Go — default)
+make c          # build the C port -> ./c/tracep
+make all        # build both
+make test       # run the black-box suite against each build
 make linux      # cross-compile static linux/amd64 + linux/arm64 into dist/
 make darwin     # cross-compile macOS amd64 + arm64 into dist/
-
-cd c && make    # build the C port (./c/tracep) for the host
 ```
+
+One Makefile drives both implementations; the Go cross-compile/release
+targets are Go-only and unchanged.
 
 The binary builds and runs on Linux and macOS. The Linux-only tracers
 (`net`/`tls`/`exec`) are gated behind `//go:build linux`; on macOS they

@@ -11,10 +11,22 @@ LDFLAGS := -s -w \
   -X $(PKG)/internal/exectrace.version=$(VERSION) \
   -X $(PKG)/internal/cafetch.version=$(VERSION)
 
-.PHONY: all linux darwin vet test release clean
+# Two implementations share this Makefile:
+#   make        Go binary  -> ./tracep            (default)
+#   make c      C  binary  -> ./c/tracep
+#   make all    both
+#   make test   bash suite vs each built binary
+# Go cross-compile / release targets are Go-only and unchanged.
+.DEFAULT_GOAL := go
+.PHONY: go c all linux darwin vet unit test test-go test-c release clean
 
-all:
+go:
 	go build -ldflags "$(LDFLAGS)" -o $(BIN) .
+
+c:
+	$(MAKE) -C c VERSION=$(VERSION)
+
+all: go c
 
 linux:
 	mkdir -p dist
@@ -35,8 +47,24 @@ vet:
 unit:
 	go test ./...
 
+# Run the black-box suite against each build. Override one with
+# `make test-go` / `make test-c`, or point at an existing binary via
+# `make test TRACEP=/path/to/tracep` (single run, back-compat).
 test:
+ifneq ($(TRACEP),)
 	TRACEP=$(TRACEP) bash test/run.sh
+else
+	$(MAKE) test-go
+	$(MAKE) test-c
+endif
+
+test-go: go
+	@echo "── suite vs Go (./$(BIN)) ──"
+	TRACEP=$(CURDIR)/$(BIN) bash test/run.sh
+
+test-c: c
+	@echo "── suite vs C (./c/$(BIN)) ──"
+	TRACEP=$(CURDIR)/c/$(BIN) bash test/run.sh
 
 # release: versioned linux+darwin binaries + RPMs (amd64/arm64) + checksums
 release: linux darwin
@@ -49,3 +77,4 @@ release: linux darwin
 
 clean:
 	rm -rf $(BIN) dist
+	$(MAKE) -C c clean
