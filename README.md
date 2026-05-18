@@ -352,6 +352,29 @@ port/transaction tables page in and its peak RSS overtakes Go's
 GC-managed maps. And Go's binary, while ~60× larger, has *zero* runtime
 dependencies, whereas C's `ca` needs OpenSSL present.
 
+#### Per-tracer, under load
+
+Each tracer driven by a fixed local workload while running
+(median of repeated runs; CPU = (utime+stime) from `/proc/<pid>/stat`,
+RSS = peak `VmHWM`):
+
+| Tracer | Workload | CPU Go | CPU C | RSS Go | RSS C | Threads Go→C |
+|---|---|---:|---:|---:|---:|---:|
+| `dns`  | 1,200 lookups, all traffic | ~3.4–3.8 s | **~0.34 s** | ~12.4 MB | 15.5 MB | 9 → **1** |
+| `net`  | 1,000 TCP connects | **~1.7 s** | ~1.9 s | 11.5 MB | **3.6 MB** | 8 → **1** |
+| `tls`  | 300 local TLS handshakes | ~0.9 s | **0.45 s** | 12.3 MB | **4.8 MB** | 9 → **1** |
+| `exec` | 4,000 `exec()`s | ~0.8 s | **0.58 s** | 11.8 MB | **3.6 MB** | 7 → **1** |
+
+The pattern holds across all four: C is **single-threaded** vs Go's 7–9
+runtime threads and uses **~2.6–3.3× less resident memory** for the
+event-driven tracers (`net`/`tls`/`exec`). CPU favours C on `tls`/`exec`
+(~1.4–2×) and dramatically on `dns` (~10×, the packet-flood zero-alloc
+case). `net` is the lone near-tie — it is bound by the `/proc`
+inode→PID scan on every conntrack event, which costs both
+implementations the same regardless of language. (`dns` is the one place
+C's peak RSS exceeds Go's, from its fixed 64 K-slot tables; for the other
+three C's static tables stay far below Go's runtime + GC heap.)
+
 ### Pros / cons
 
 | | Go | C |
