@@ -24,15 +24,21 @@ Each subcommand keeps the exact flags and behaviour of its original
 ## Build
 
 ```sh
-make            # build ./tracep for the host
+make            # build ./tracep for the host (Go)
 make linux      # cross-compile static linux/amd64 + linux/arm64 into dist/
 make darwin     # cross-compile macOS amd64 + arm64 into dist/
+
+cd c && make    # build the C port (./c/tracep) for the host
 ```
 
 The binary builds and runs on Linux and macOS. The Linux-only tracers
 (`net`/`tls`/`exec`) are gated behind `//go:build linux`; on macOS they
 are present but exit with a Linux-only message, while `ca` and `dns`
 (BPF) work natively. It cross-compiles from any platform.
+
+There are **two implementations** — the reference Go binary and a
+behaviour-identical C port in `c/` — compared in detail under
+[Two implementations: Go and C](#two-implementations-go-and-c).
 
 ## Usage
 
@@ -267,8 +273,87 @@ The suite is OS-aware:
   BPF capture when run as root (skips otherwise).
 - Other OSes — live suites skip with a clear message.
 
-Latest runs: **54/54 green** on Linux 6.12 x86-64; **43/43 green** on
-macOS (arm64, unprivileged — dns BPF capture skipped without root).
+Latest runs (**both implementations**, same black-box suite): **54/54
+green** on Linux 6.12 x86-64; **43/43 green** on macOS (arm64,
+unprivileged — dns BPF capture skipped without root).
+
+## Two implementations: Go and C
+
+`tracep` exists twice. The **Go** binary (`main.go` + `internal/`) is the
+reference. The **C** port (`c/`) is a faithful, behaviour-for-behaviour
+re-implementation — same flags, same output, same ANSI/emoji, same error
+text — that passes the *identical* black-box test suite (54/54 Linux,
+43/43 macOS). Build the C version with `cd c && make`.
+
+Both make the same platform trade-offs: `net`/`tls`/`exec` are Linux-only
+(stub out elsewhere), `dns` adds a macOS `/dev/bpf` backend, `ca` is
+cross-platform.
+
+### Lines of code
+
+Total source (excluding the shared bash test suite):
+
+| Tracer    | Go (lines) | C (lines) | Notes |
+|-----------|-----------:|----------:|-------|
+| dispatch  |   73 | 62 + **173** shared¹ | ¹`c/common.{c,h}` (color, isatty, shquote) |
+| `dns`     | 1219 |  652 | Go split across 11 files (help + per-OS); C consolidates it |
+| `net`     | 1074 | 1267 | C hand-walks netlink/NLA + a hash map for connDB |
+| `tls`     |  795 |  983 | C uses POSIX `regex.h`; manual ftrace fd plumbing |
+| `exec`    |  730 | 1000 | C hand-walks the proc-connector netlink stream |
+| `ca`      |  233 |  738 | **starkest gap** — see below |
+| **Total** | **4026** | **4813** | code-only (no blank/comment): **3262** vs **3918** |
+
+The C port is ~20% larger overall. Three tracers (`net`/`tls`/`exec`) are
+modestly bigger because work the Go stdlib does for free
+(`syscall.ParseNetlinkMessage`, `regexp`, `encoding/binary`, `net.IP`,
+goroutines, maps) becomes explicit C. `dns` is actually *smaller* in C —
+the Go version is fragmented across many small per-OS files. `ca` is the
+extreme: **233 → 738 lines**, because Go's `crypto/tls` + `net/http` +
+`crypto/x509` collapse a TLS dial, chain walk, AIA fetch and PEM encode
+into a handful of calls; in C that is OpenSSL boilerplate plus a
+hand-written HTTP client.
+
+### Benchmarks
+
+Measured on `mia` (Linux 6.12 x86-64). Go: cross-compiled static,
+stripped (`-s -w`). C: GCC 14, `-O2`, dynamically linked.
+
+| Metric | Go | C | |
+|---|---:|---:|---|
+| Binary size            | 6,676,642 B (6.4 MB) | 75,480 B (74 KB) | C ≈ **88× smaller** |
+| Runtime dependencies   | none (static)        | libc + libssl/libcrypto/libz | Go is copy-anywhere |
+| Startup (`ca -version`, 100×) | 3.46 ms | 3.47 ms | **tie** |
+| Peak RSS (`dns`, capturing) | 5,984 KB | 2,820 KB | C ≈ **2.1× leaner** |
+| Threads at rest (`dns`) | 7 (GC/sched/sysmon) | 1 | — |
+
+Startup is a wash (process spawn dominates). The real runtime differences
+are footprint: C is far smaller on disk and roughly half the resident
+memory, single-threaded where Go runs a 7-thread runtime. The cost is
+that C's `ca` needs OpenSSL present at runtime, whereas the Go binary has
+no dependencies at all.
+
+### Pros / cons
+
+| | Go | C |
+|---|---|---|
+| **Binary size**        | 6.4 MB | **74 KB** |
+| **Dependencies**       | **none** (single static file) | libssl/libcrypto for `ca` |
+| **Memory**             | ~6 MB RSS, 7 threads | **~2.8 MB RSS, 1 thread** |
+| **Cross-compilation**  | **trivial** (`GOOS=… go build`) | per-target toolchain + headers |
+| **Code volume**        | **~20% less**, esp. `ca` | more explicit boilerplate |
+| **Memory safety**      | **GC, bounds-checked** | manual buffers, hand-rolled maps |
+| **Reviewability**      | stdlib hides the syscalls | **every syscall is visible** |
+| **Edit/build loop**    | fast, batteries-included | small deps, but more to maintain |
+
+### Which to use
+
+Prefer **Go** for distribution and day-to-day use: one dependency-free
+binary that cross-compiles anywhere, with the safety the GC and stdlib
+buy. Reach for **C** when binary size or memory genuinely matter
+(initramfs, tiny containers, embedded), or when you want the kernel
+interactions spelled out with nothing between the code and the syscall —
+accepting OpenSSL as `ca`'s one runtime dependency and a larger surface
+to maintain.
 
 ## Origin
 

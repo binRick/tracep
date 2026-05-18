@@ -1,4 +1,5 @@
 /tracep
+/c/tracep
 /dist/
 *.test
 *.out
