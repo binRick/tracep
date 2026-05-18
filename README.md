@@ -319,30 +319,48 @@ hand-written HTTP client.
 
 ### Benchmarks
 
-Measured on `mia` (Linux 6.12 x86-64). Go: cross-compiled static,
-stripped (`-s -w`). C: GCC 14, `-O2`, dynamically linked.
+Measured on `mia` (Linux 6.12 x86-64, kernel-6.12). Go: cross-compiled
+static, stripped (`-s -w`). C: GCC 14, `-O2`, dynamically linked. Both
+pass the **identical** black-box suite there — **54/54 green** for each
+(`make test-c`; Go via the suite vs the cross-compiled binary). Figures
+are the median of repeated runs.
 
 | Metric | Go | C | |
 |---|---:|---:|---|
-| Binary size            | 6,676,642 B (6.4 MB) | 75,480 B (74 KB) | C ≈ **88× smaller** |
-| Runtime dependencies   | none (static)        | libc + libssl/libcrypto/libz | Go is copy-anywhere |
-| Startup (`ca -version`, 100×) | 3.46 ms | 3.47 ms | **tie** |
-| Peak RSS (`dns`, capturing) | 5,984 KB | 2,820 KB | C ≈ **2.1× leaner** |
-| Threads at rest (`dns`) | 7 (GC/sched/sysmon) | 1 | — |
+| Binary size                 | 6,676,642 B (6.4 MB) | 108,528 B (106 KB) | C ≈ **61× smaller** |
+| Runtime dependencies        | none (static)        | libc + libssl/libcrypto/libz | Go is copy-anywhere |
+| Startup (200× `-v`)         | ~2.6–3.2 ms | ~1.8–2.2 ms | C ≈ **1.4× faster** |
+| RSS at rest (`dns`)         | 5,896 KB | 2,808 KB | C ≈ **2.1× leaner** |
+| Threads at rest             | 7 (GC/sched/sysmon) | 1 | — |
+| CPU for a fixed DNS workload¹ | ~3.4–3.8 s | ~0.34 s | Go ≈ **10× more CPU** |
+| Peak RSS under that load    | ~12.4 MB | ~15.5 MB | **Go leaner here** |
 
-Startup is a wash (process spawn dominates). The real runtime differences
-are footprint: C is far smaller on disk and roughly half the resident
-memory, single-threaded where Go runs a 7-thread runtime. The cost is
-that C's `ca` needs OpenSSL present at runtime, whereas the Go binary has
-no dependencies at all.
+¹1,200 lookups while capturing all host traffic via `AF_PACKET`;
+process CPU = (utime+stime) from `/proc/<pid>/stat`. (One outlier run hit
+31 s for Go during a host-traffic burst — excluded; the ~10× figure is
+the stable, repeatable result.)
+
+The headline is **CPU under packet load**: Go burns roughly an order of
+magnitude more CPU than C to parse the same traffic, because every packet
+goes through allocation + GC (slices, strings, maps) while the C parser
+is zero-allocation. That, plus a 61× smaller binary, ~1.4× faster
+startup, half the resting memory and a single thread, is the C case.
+
+The honest counter-points: startup difference is small (process spawn
+dominates) and **memory crosses over under load** — C's fixed 64 K-slot
+port/transaction tables page in and its peak RSS overtakes Go's
+GC-managed maps. And Go's binary, while ~60× larger, has *zero* runtime
+dependencies, whereas C's `ca` needs OpenSSL present.
 
 ### Pros / cons
 
 | | Go | C |
 |---|---|---|
-| **Binary size**        | 6.4 MB | **74 KB** |
+| **Binary size**        | 6.4 MB | **106 KB** |
 | **Dependencies**       | **none** (single static file) | libssl/libcrypto for `ca` |
-| **Memory**             | ~6 MB RSS, 7 threads | **~2.8 MB RSS, 1 thread** |
+| **CPU under load**     | ~10× more (per-packet GC) | **zero-alloc parse** |
+| **Memory at rest**     | ~5.9 MB RSS, 7 threads | **~2.8 MB RSS, 1 thread** |
+| **Memory under load**  | **~12 MB** (GC-managed maps) | ~15 MB (fixed 64 K tables) |
 | **Cross-compilation**  | **trivial** (`GOOS=… go build`) | per-target toolchain + headers |
 | **Code volume**        | **~20% less**, esp. `ca` | more explicit boilerplate |
 | **Memory safety**      | **GC, bounds-checked** | manual buffers, hand-rolled maps |
@@ -353,11 +371,12 @@ no dependencies at all.
 
 Prefer **Go** for distribution and day-to-day use: one dependency-free
 binary that cross-compiles anywhere, with the safety the GC and stdlib
-buy. Reach for **C** when binary size or memory genuinely matter
-(initramfs, tiny containers, embedded), or when you want the kernel
-interactions spelled out with nothing between the code and the syscall —
-accepting OpenSSL as `ca`'s one runtime dependency and a larger surface
-to maintain.
+buy. Reach for **C** when binary size, startup, or **sustained CPU under
+heavy packet/event load** matter (it parses the same DNS traffic for ~⅒
+the CPU), or for initramfs/tiny-container/embedded targets, or when you
+want the kernel interactions spelled out with nothing between the code
+and the syscall — accepting OpenSSL as `ca`'s one runtime dependency, a
+larger memory footprint under load, and more surface to maintain.
 
 ## Origin
 
