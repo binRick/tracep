@@ -352,9 +352,9 @@ port/transaction tables page in and its peak RSS overtakes Go's
 GC-managed maps. And Go's binary, while ~60× larger, has *zero* runtime
 dependencies, whereas C's `ca` needs OpenSSL present.
 
-#### Per-tracer, under load
+#### Every mode, Linux (`mia`, 6.12 x86-64)
 
-Each tracer driven by a fixed local workload while running
+The four live tracers driven by a fixed local workload while running
 (median of repeated runs; CPU = (utime+stime) from `/proc/<pid>/stat`,
 RSS = peak `VmHWM`):
 
@@ -365,15 +365,43 @@ RSS = peak `VmHWM`):
 | `tls`  | 300 local TLS handshakes | ~0.9 s | **0.45 s** | 12.3 MB | **4.8 MB** | 9 → **1** |
 | `exec` | 4,000 `exec()`s | ~0.8 s | **0.58 s** | 11.8 MB | **3.6 MB** | 7 → **1** |
 
-The pattern holds across all four: C is **single-threaded** vs Go's 7–9
+`ca` is a one-shot tool, not a daemon — measured differently, as 50
+cert-chain fetches against a local TLS server (`getrusage` per
+invocation):
+
+| `ca` (per fetch) | Wall | CPU | Peak RSS |
+|---|---:|---:|---:|
+| Go | 42.1 ms | 43.1 ms | 12.8 MB |
+| C  | **14.0 ms** | **12.4 ms** | **10.6 MB** |
+
+The pattern holds across all five: C is **single-threaded** vs Go's 7–9
 runtime threads and uses **~2.6–3.3× less resident memory** for the
-event-driven tracers (`net`/`tls`/`exec`). CPU favours C on `tls`/`exec`
-(~1.4–2×) and dramatically on `dns` (~10×, the packet-flood zero-alloc
-case). `net` is the lone near-tie — it is bound by the `/proc`
-inode→PID scan on every conntrack event, which costs both
-implementations the same regardless of language. (`dns` is the one place
-C's peak RSS exceeds Go's, from its fixed 64 K-slot tables; for the other
-three C's static tables stay far below Go's runtime + GC heap.)
+event-driven tracers. CPU favours C on `tls`/`exec` (~1.4–2×),
+dramatically on `dns` (~10×, the packet-flood zero-alloc case) and on
+one-shot `ca` (~3× — Go's runtime init dominates a short-lived process).
+`net` is the lone near-tie — bound by the `/proc` inode→PID scan on
+every conntrack event, a syscall cost identical in both languages.
+(`dns` is the one place C's peak RSS exceeds Go's, from its fixed
+64 K-slot tables; everywhere else C's static tables stay well below
+Go's runtime + GC heap.)
+
+#### macOS (this host, 26.2 arm64)
+
+Only `ca` and `dns` run natively on macOS; `net`/`tls`/`exec` are
+Linux-only stubs (print the message and exit instantly), and `dns`'s
+`/dev/bpf` capture needs root (skipped unprivileged, as in the suite).
+So `ca` is the representative cross-platform workload:
+
+| | Binary size | `ca` wall/fetch | `ca` CPU/fetch | `ca` peak RSS |
+|---|---:|---:|---:|---:|
+| Go | 5,919,042 B (5.6 MB) | 18.3 ms | 7.3 ms | 15.2 MB |
+| C  | **75,480 B (74 KB)** | **10.4 ms** | 8.8 ms | **7.2 MB** |
+
+Same shape as Linux: the C binary is ~79× smaller and ~1.8× faster
+per fetch with half the resident memory; CPU is near-parity here (macOS
+LibreSSL vs Go's `crypto/tls` differ less than on Linux). The
+`net`/`tls`/`exec` stubs are sub-millisecond either way — not a
+meaningful benchmark, just a portability guarantee.
 
 ### Pros / cons
 
