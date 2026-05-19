@@ -18,7 +18,7 @@ LDFLAGS := -s -w \
 #   make test   bash suite vs each built binary
 # Go cross-compile / release targets are Go-only and unchanged.
 .DEFAULT_GOAL := go
-.PHONY: go c all linux darwin vet unit test test-go test-c release clean
+.PHONY: go c all linux darwin vet unit test test-go test-c benchmark release clean
 
 go:
 	go build -ldflags "$(LDFLAGS)" -o $(BIN) .
@@ -65,6 +65,18 @@ test-go: go
 test-c: c
 	@echo "── suite vs C (./c/$(BIN)) ──"
 	TRACEP=$(CURDIR)/c/$(BIN) bash test/run.sh
+
+# benchmark: build both, then drive every mode with a local workload and
+# report CPU / RSS / threads (Go vs C). The Linux live tracers need root
+# (`sudo make benchmark`); `ca` runs anywhere. Builds Go only if a
+# toolchain is present — otherwise pass a prebuilt binary:
+#   make benchmark BENCH_GO=/path/to/tracep-go
+BENCH_GO ?= $(CURDIR)/$(BIN)
+BENCH_C  ?= $(CURDIR)/c/$(BIN)
+benchmark: c
+	@command -v go >/dev/null 2>&1 && $(MAKE) go || \
+	  echo "no go toolchain — using BENCH_GO=$(BENCH_GO)"
+	GO_BIN="$(BENCH_GO)" C_BIN="$(BENCH_C)" bash bench/run.sh
 
 # release: versioned linux+darwin binaries + RPMs (amd64/arm64) + checksums
 release: linux darwin
