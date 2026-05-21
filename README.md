@@ -436,3 +436,21 @@ Consolidated from `proc-trace-net`, `proc-trace-tls`, `proc-trace-dns`,
 `internal/` (only `package`/`main` renamed, plus per-subcommand `flag.FlagSet`
 isolation so the merged binary doesn't share global flag state); `main.go`
 only dispatches.
+
+<!-- scc-start -->
+## Code Statistics
+
+| Language | Files | Lines | Blanks | Comments | Code | Complexity |
+|---|---|---|---|---|---|---|
+| Go | 17 | 4,125 | 475 | 307 | 3,343 | 892 |
+| Shell | 11 | 553 | 64 | 91 | 398 | 101 |
+| C | 7 | 4,767 | 483 | 349 | 3,935 | 1,313 |
+| Makefile | 2 | 137 | 22 | 30 | 85 | 7 |
+| C Header | 1 | 46 | 8 | 20 | 18 | 0 |
+| Markdown | 1 | 438 | 99 | 0 | 339 | 0 |
+| Python | 1 | 23 | 3 | 4 | 16 | 3 |
+| YAML | 1 | 24 | 0 | 2 | 22 | 0 |
+| **Total** | **41** | **10,113** | **1,154** | **803** | **8,156** | **2,316** |
+
+*Generated with [scc](https://github.com/boyter/scc) on 2026-05-20*
+<!-- scc-end -->
