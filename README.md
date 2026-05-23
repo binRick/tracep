@@ -446,11 +446,16 @@ only dispatches.
 | Shell | 11 | 553 | 64 | 91 | 398 | 101 |
 | C | 7 | 4,767 | 483 | 349 | 3,935 | 1,313 |
 | Makefile | 2 | 137 | 22 | 30 | 85 | 7 |
+| Markdown | 2 | 462 | 103 | 0 | 359 | 0 |
 | C Header | 1 | 46 | 8 | 20 | 18 | 0 |
-| Markdown | 1 | 438 | 99 | 0 | 339 | 0 |
 | Python | 1 | 23 | 3 | 4 | 16 | 3 |
 | YAML | 1 | 24 | 0 | 2 | 22 | 0 |
-| **Total** | **41** | **10,113** | **1,154** | **803** | **8,156** | **2,316** |
+| **Total** | **42** | **10,137** | **1,158** | **803** | **8,176** | **2,316** |
 
-*Generated with [scc](https://github.com/boyter/scc) on 2026-05-20*
+- **Estimated Cost to Develop (organic):** $245,337
+- **Estimated Schedule Effort (organic):** 8.06 months
+- **Estimated People Required (organic):** 2.70
+- **Processed:** 339,540 bytes (0.340 megabytes)
+
+*Generated with [scc](https://github.com/boyter/scc) on 2026-05-22*
 <!-- scc-end -->
