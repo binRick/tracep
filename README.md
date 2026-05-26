@@ -10,13 +10,19 @@ Trace a process's network, TLS, DNS, and exec activity — one self-contained Go
 | `tracep net`  | per-process network connections | netlink socket diag + `/proc` | ✅ | ❌ |
 | `tracep tls`  | per-process TLS reads/writes & SNI | `libssl` uprobes | ✅ | ❌ |
 | `tracep dns`  | per-process DNS queries & answers | `AF_PACKET` (Linux) / BPF (macOS) | ✅ | ✅¹ |
-| `tracep exec` | per-process `exec()` syscalls | netlink proc connector | ✅ | ❌ |
+| `tracep exec` | per-process `exec()` syscalls | netlink proc connector (Linux) / `proc_listallpids` poll (macOS) | ✅ | ✅² |
 | `tracep ca`   | a host's TLS CA certificate chain | outbound TLS dial | ✅ | ✅ |
 
 ¹ macOS `dns` captures via `/dev/bpf` and shows queries **without** process
 attribution (pid `0`, name `?`) — there is no portable socket→PID map off
-Linux. On macOS, `net`/`tls`/`exec` exit immediately with a clear
-"Linux-only" message; the binary still builds and runs everywhere.
+Linux. On macOS, `net`/`tls` exit immediately with a clear "Linux-only"
+message; the binary still builds and runs everywhere.
+
+² macOS `exec` polls `proc_listallpids` every 50 ms (override with `-i
+MS`). Reliably catches any process living longer than the interval;
+*misses* shorter-lived processes — for those you'd need Apple's
+EndpointSecurity framework with an entitlement (or partial-SIP DTrace).
+Works without root for own-user processes; root sees every process.
 
 Each subcommand keeps the exact flags and behaviour of its original
 `proc-trace-*` / `tls-ca-fetch` tool — run `tracep <command> -h` for details.
@@ -36,9 +42,11 @@ One Makefile drives both implementations; the Go cross-compile/release
 targets are Go-only and unchanged.
 
 The binary builds and runs on Linux and macOS. The Linux-only tracers
-(`net`/`tls`/`exec`) are gated behind `//go:build linux`; on macOS they
-are present but exit with a Linux-only message, while `ca` and `dns`
-(BPF) work natively. It cross-compiles from any platform.
+(`net`/`tls`) are gated behind `//go:build linux`; on macOS they are
+present but exit with a Linux-only message. `ca`, `dns` (BPF), and
+`exec` (polling) work natively on macOS. Pure-stdlib Go — `exec` calls
+Apple's `proc_info` syscall via `syscall.Syscall6`, no cgo, no extra
+deps — so it still cross-compiles from any platform.
 
 There are **two implementations** — the reference Go binary and a
 behaviour-identical C port in `c/` — compared in detail under
@@ -128,8 +136,9 @@ whose socket wasn't attributable at capture time.)
 
 ### `tracep exec` — every program launch
 
-Subscribes to the netlink **proc connector** and prints each `exec()`
-system-wide with PID and full argv — a live audit log of what is being run:
+On **Linux**, subscribes to the netlink **proc connector** and prints
+each `exec()` system-wide with PID and full argv — a live audit log of
+what is being run:
 
 ```
   3745740 ls /var/lib/docker/volumes/swaudit-reports/_data/runs/717be26344c160e9b5bcb144/
@@ -141,6 +150,25 @@ system-wide with PID and full argv — a live audit log of what is being run:
 
 This catches short-lived processes that `ps`/`top` polling miss entirely —
 useful for spotting cron jobs, container entrypoints, and unexpected shell-outs.
+
+On **macOS**, the same subcommand polls `proc_listallpids` every 50 ms
+(override with `-i MS`) and diffs against the previous snapshot. There
+is no Apple-supported event stream for `exec()` without the
+EndpointSecurity entitlement, so the polling backend is what's portable
+inside a single static Go binary. Output format and flags are
+identical:
+
+```
+$ tracep exec
+        29619 <richardblundell> /Users/me % /bin/sleep 0.5
+        29620 git -C ~/Desktop/repos/foo commit -m 'wip'
+        29622 /usr/bin/ssh git@github.com 'git-receive-pack '\''foo.git'\'''
+```
+
+Tradeoff: anything that exec+exits inside one poll interval is missed
+(e.g. shell-built `:`, or a long pipeline of `/bin/true`s). For
+sustained workloads or longer-running commands the coverage is
+indistinguishable from the Linux backend.
 
 ### `tracep ca` — certificate chain fetch
 
@@ -249,14 +277,18 @@ Combines a regression check with live capture.
 | Same, with `tracep dns -j` | JSON mode: output is line-delimited objects (`{… "query": …}`) suitable for `jq` |
 | Throughout | No `panic:` |
 
-#### `06_exec` — program-launch audit (root + Linux)
+#### `06_exec` — program-launch audit (Linux: root; macOS: own-user)
 
-Runs `tracep exec`, then launches known short-lived processes.
+Runs `tracep exec`, then launches known processes. On Linux the netlink
+proc connector catches even `/bin/true` (~1 ms); on macOS the 50 ms
+polling backend reliably catches the longer-lived `/bin/sleep 0.2`
+processes added to `gen_exec` for cross-platform coverage.
 
 | Test action | What tracep detects / asserts |
 |---|---|
-| Start `tracep exec` as root | Subscribes to the proc connector without a privilege error |
-| Run `/bin/true` and `uname -a` repeatedly | Those `exec()`s appear in the stream (`true`, `uname`, `/bin/`, `/usr/bin/`) — including processes too short-lived for `ps` polling to catch |
+| Start `tracep exec` | Linux: subscribes to the proc connector; macOS: starts the polling loop. Neither prints a privilege error. |
+| macOS only (non-root) | The tracer is no longer the "Linux-only" stub and does not panic |
+| Generate `/bin/true`, `uname -a`, and backgrounded `/bin/sleep 0.2` | Those `exec()`s appear in the stream (`sleep`, `true`, `uname`, `/bin/`, `/usr/bin/`) |
 | Throughout | No `panic:` |
 
 ### Notes on reliability
@@ -271,15 +303,18 @@ The suite is OS-aware:
 
 - **Linux** — all six suites run; the four live tracers need root (skip,
   don't fail, otherwise).
-- **macOS** — `01_dispatch` and `02_ca` run fully; `net`/`tls`/`exec`
-  switch to a **stub assertion** (must exit non-zero with the Linux-only
-  message); `05_dns` runs its `-h` regression everywhere and its live
-  BPF capture when run as root (skips otherwise).
+- **macOS** — `01_dispatch` and `02_ca` run fully; `net`/`tls` switch to
+  a **stub assertion** (must exit non-zero with the Linux-only message);
+  `05_dns` runs its `-h` regression everywhere and its live BPF capture
+  when run as root (skips otherwise); `06_exec` runs the cross-platform
+  live capture and, additionally on macOS non-root, asserts the polling
+  backend is wired in (no Linux-only stub, no panic).
 - Other OSes — live suites skip with a clear message.
 
 Latest runs (**both implementations**, same black-box suite): **54/54
-green** on Linux 6.12 x86-64; **43/43 green** on macOS (arm64,
-unprivileged — dns BPF capture skipped without root).
+green** on Linux 6.12 x86-64; **42/42 green** on macOS (arm64,
+unprivileged — dns BPF capture and live exec skipped without root; the
+darwin sanity check still runs).
 
 ## Two implementations: Go and C
 
@@ -289,9 +324,9 @@ re-implementation — same flags, same output, same ANSI/emoji, same error
 text — that passes the *identical* black-box test suite (54/54 Linux,
 43/43 macOS). Build the C version with `cd c && make`.
 
-Both make the same platform trade-offs: `net`/`tls`/`exec` are Linux-only
-(stub out elsewhere), `dns` adds a macOS `/dev/bpf` backend, `ca` is
-cross-platform.
+Both make the same platform trade-offs: `net`/`tls` are Linux-only
+(stub out elsewhere), `dns` adds a macOS `/dev/bpf` backend, `exec`
+adds a macOS `proc_listallpids`-polling backend, `ca` is cross-platform.
 
 ### Lines of code
 
@@ -387,10 +422,12 @@ Go's runtime + GC heap.)
 
 #### macOS (this host, 26.2 arm64)
 
-Only `ca` and `dns` run natively on macOS; `net`/`tls`/`exec` are
-Linux-only stubs (print the message and exit instantly), and `dns`'s
-`/dev/bpf` capture needs root (skipped unprivileged, as in the suite).
-So `ca` is the representative cross-platform workload:
+`ca`, `dns`, and `exec` run natively on macOS; `net` and `tls` are
+Linux-only stubs (print the message and exit instantly), `dns`'s
+`/dev/bpf` capture needs root (skipped unprivileged, as in the suite),
+and `exec` polls `proc_listallpids` (50 ms default; the Linux
+proc-connector path is event-driven). `ca` is the representative
+cross-platform throughput workload:
 
 | | Binary size | `ca` wall/fetch | `ca` CPU/fetch | `ca` peak RSS |
 |---|---:|---:|---:|---:|
@@ -442,20 +479,20 @@ only dispatches.
 
 | Language | Files | Lines | Blanks | Comments | Code | Complexity |
 |---|---|---|---|---|---|---|
-| Go | 17 | 4,125 | 475 | 307 | 3,343 | 892 |
-| Shell | 11 | 553 | 64 | 91 | 398 | 101 |
-| C | 7 | 4,767 | 483 | 349 | 3,935 | 1,313 |
+| Go | 18 | 4,892 | 537 | 389 | 3,966 | 1,060 |
+| Shell | 11 | 571 | 66 | 101 | 404 | 102 |
+| C | 7 | 5,495 | 546 | 401 | 4,548 | 1,512 |
 | Makefile | 2 | 137 | 22 | 30 | 85 | 7 |
-| Markdown | 2 | 462 | 103 | 0 | 359 | 0 |
+| Markdown | 2 | 504 | 108 | 0 | 396 | 0 |
 | C Header | 1 | 46 | 8 | 20 | 18 | 0 |
 | Python | 1 | 23 | 3 | 4 | 16 | 3 |
 | YAML | 1 | 24 | 0 | 2 | 22 | 0 |
-| **Total** | **42** | **10,137** | **1,158** | **803** | **8,176** | **2,316** |
+| **Total** | **43** | **11,692** | **1,290** | **947** | **9,455** | **2,684** |
 
-- **Estimated Cost to Develop (organic):** $245,337
-- **Estimated Schedule Effort (organic):** 8.06 months
-- **Estimated People Required (organic):** 2.70
-- **Processed:** 339,540 bytes (0.340 megabytes)
+- **Estimated Cost to Develop (organic):** $285,785
+- **Estimated Schedule Effort (organic):** 8.54 months
+- **Estimated People Required (organic):** 2.97
+- **Processed:** 391,885 bytes (0.392 megabytes)
 
-*Generated with [scc](https://github.com/boyter/scc) on 2026-05-22*
+*Generated with [scc](https://github.com/boyter/scc) on 2026-05-26*
 <!-- scc-end -->

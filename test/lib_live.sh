@@ -26,7 +26,13 @@ gen_dns() {
 }
 gen_net() { curl -s -m 6 -o /dev/null http://example.com 2>/dev/null; }
 gen_tls() { curl -s -m 6 -o /dev/null https://example.com 2>/dev/null; }
-gen_exec() { for i in 1 2 3 4 5; do /bin/true; /usr/bin/uname -a >/dev/null; done; }
+# Linux netlink catches /bin/true and uname in microseconds; macOS polling
+# only sees processes that live longer than the poll interval (default 50ms),
+# so add backgrounded sleeps that are guaranteed to span at least one tick.
+gen_exec() {
+  for i in 1 2 3 4 5; do /bin/true; /usr/bin/uname -a >/dev/null; done
+  /bin/sleep 0.2 & /bin/sleep 0.2 & /bin/sleep 0.2 & wait
+}
 
 # live_test <label> <gen-fn> <expect-regex> -- <tracep subcmd + args...>
 #   Runs on Linux (AF_PACKET) and macOS (BPF). Skips (not fails) when not

@@ -974,14 +974,742 @@ int exec_main(int argc, char **argv) {
     }
 }
 
-#else // ── non-Linux stub (port of exec_other.go) ────────────────────────────
+#elif defined(__APPLE__) // ── macOS polling impl (mirror of exec_darwin.go) ──
+
+// macOS exec tracer — polls proc_listallpids() every -i ms and diffs
+// against the previous snapshot. New pids → exec event; pids that
+// disappear → exit event (with timing but no exit code: polling can't
+// know what waitpid would have returned). Short-lived processes that
+// exec+exit inside one interval are missed. The shape of the impl
+// follows exec_darwin.go so the same flags, same output, same edge
+// cases hold in either port.
+#include <libproc.h>
+#include <pwd.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <sys/proc_info.h>
+#include <sys/stat.h>
+#include <sys/sysctl.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <time.h>
+
+// ─── Global options ───────────────────────────────────────────────────────────
+
+static int32_t  watchPIDs[256];
+static int      nWatchPIDs;
+static bool     showCwd;
+static bool     showEnv;
+static bool     flatMode;
+static bool     fullPath;
+static bool     showArgs       = true;
+static bool     showErrors     = true;
+static bool     showExit;
+static bool     showUser;
+static bool     colorMode;
+static bool     colorForce;
+static FILE    *out; // set in exec_main
+static int      pollIntervalMs = 50;
+
+// ─── Per-pid snapshot for delta detection ─────────────────────────────────────
+
+typedef struct {
+    bool      used;
+    int32_t   pid;
+    int32_t   ppid;
+    uint32_t  uid;
+    uint64_t  startSec;
+    uint64_t  startUsec;
+    char     *argv0;
+    int       depth;   // -1 = not in any watched subtree
+} macEntry;
+
+#define MACDB_CAP 16384 // power of two; load kept well under 1/2
+static macEntry macDB[MACDB_CAP];
+static int      macDBLen;
+
+static unsigned macdb_hash(int32_t pid) {
+    return ((unsigned)pid * 2654435761u) & (MACDB_CAP - 1);
+}
+static macEntry *macdb_find(int32_t pid) {
+    unsigned i = macdb_hash(pid);
+    for (unsigned probe = 0; probe < MACDB_CAP; probe++) {
+        macEntry *e = &macDB[(i + probe) & (MACDB_CAP - 1)];
+        if (!e->used) return NULL;
+        if (e->pid == pid) return e;
+    }
+    return NULL;
+}
+static macEntry *macdb_get(int32_t pid, bool *created) {
+    unsigned i = macdb_hash(pid);
+    for (unsigned probe = 0; probe < MACDB_CAP; probe++) {
+        macEntry *e = &macDB[(i + probe) & (MACDB_CAP - 1)];
+        if (e->used && e->pid == pid) { if (created) *created = false; return e; }
+        if (!e->used) {
+            memset(e, 0, sizeof *e);
+            e->used  = true;
+            e->pid   = pid;
+            e->depth = -1;
+            macDBLen++;
+            if (created) *created = true;
+            return e;
+        }
+    }
+    return NULL;
+}
+static void macdb_delete(int32_t pid) {
+    unsigned i = macdb_hash(pid);
+    unsigned slot = (unsigned)-1;
+    for (unsigned probe = 0; probe < MACDB_CAP; probe++) {
+        macEntry *e = &macDB[(i + probe) & (MACDB_CAP - 1)];
+        if (!e->used) return;
+        if (e->pid == pid) { slot = (i + probe) & (MACDB_CAP - 1); break; }
+    }
+    if (slot == (unsigned)-1) return;
+    free(macDB[slot].argv0);
+    macDB[slot].used  = false;
+    macDB[slot].argv0 = NULL;
+    macDBLen--;
+    unsigned j = slot;
+    for (;;) {
+        j = (j + 1) & (MACDB_CAP - 1);
+        macEntry *e = &macDB[j];
+        if (!e->used) break;
+        macEntry tmp = *e;
+        e->used  = false;
+        e->argv0 = NULL;
+        macDBLen--;
+        bool created;
+        macEntry *ne = macdb_get(tmp.pid, &created);
+        ne->ppid      = tmp.ppid;
+        ne->uid       = tmp.uid;
+        ne->startSec  = tmp.startSec;
+        ne->startUsec = tmp.startUsec;
+        ne->argv0     = tmp.argv0;
+        ne->depth     = tmp.depth;
+    }
+}
+
+// ─── Color / error helpers ────────────────────────────────────────────────────
+
+static const char *c(const char *code, const char *s) {
+    return clr(colorMode, code, s);
+}
+
+static bool isWatchRoot(int32_t pid) {
+    for (int i = 0; i < nWatchPIDs; i++)
+        if (watchPIDs[i] == pid) return true;
+    return false;
+}
+
+static void fatalf(const char *f, ...) {
+    fputs("tracep exec: ", stderr);
+    va_list ap;
+    va_start(ap, f);
+    vfprintf(stderr, f, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    exit(1);
+}
+static void fatal(const char *msg) {
+    fprintf(stderr, "tracep exec: %s\n", msg);
+    exit(1);
+}
+
+// ─── libproc / sysctl wrappers ────────────────────────────────────────────────
+
+// procListAllPIDs fills *out_pids (malloc'd) with every live pid. Returns
+// count; caller frees *out_pids. Returns 0 on error.
+static int procListAllPIDs(int32_t **out_pids) {
+    int sz = proc_listallpids(NULL, 0);
+    if (sz <= 0) { *out_pids = NULL; return 0; }
+    sz = (sz + 4096) & ~3; // headroom + align to 4 bytes
+    int32_t *pids = malloc((size_t)sz);
+    if (!pids) { *out_pids = NULL; return 0; }
+    int n = proc_listallpids(pids, sz);
+    if (n <= 0) { free(pids); *out_pids = NULL; return 0; }
+    *out_pids = pids;
+    return n / 4;
+}
+
+// bsdInfo reads proc_bsdinfo for pid. Returns false if the process is
+// gone or unreadable (e.g. denied to non-root for some processes).
+static bool bsdInfo(int32_t pid, int32_t *ppid, uint32_t *uid,
+                    uint64_t *startSec, uint64_t *startUsec) {
+    struct proc_bsdinfo bi;
+    int n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof bi);
+    if (n < (int)sizeof bi) return false;
+    *ppid      = (int32_t)bi.pbi_ppid;
+    *uid       = bi.pbi_uid;
+    *startSec  = bi.pbi_start_tvsec;
+    *startUsec = bi.pbi_start_tvusec;
+    return true;
+}
+
+// pidPath returns the absolute executable path or "" if unreadable.
+// Caller frees.
+static char *pidPath(int32_t pid) {
+    char buf[PROC_PIDPATHINFO_MAXSIZE];
+    int n = proc_pidpath(pid, buf, sizeof buf);
+    if (n <= 0) return strdup("");
+    return strdup(buf);
+}
+
+// pidCwd returns the process's cwd or "EACCES"/"EUNKNOWN" on failure.
+// Caller frees.
+static char *pidCwd(int32_t pid) {
+    struct proc_vnodepathinfo vpi;
+    int n = proc_pidinfo(pid, PROC_PIDVNODEPATHINFO, 0, &vpi, sizeof vpi);
+    if (n < (int)sizeof vpi) {
+        if (errno == EACCES || errno == EPERM) return strdup("EACCES");
+        return strdup("EUNKNOWN");
+    }
+    return strdup(vpi.pvi_cdir.vip_path);
+}
+
+// pidArgvEnv reads argv (and optionally envp) via sysctl kern.procargs2.
+// Caller frees each entry and the outer arrays. Returns 0 (and NULL outs)
+// when we lacked privilege (non-root can read only own-uid processes) or
+// the process is gone.
+static int pidArgvEnv(int32_t pid, char ***argvOut, int *argvCount,
+                      char ***envOut, int *envCount) {
+    *argvOut = NULL; *argvCount = 0;
+    if (envOut) { *envOut = NULL; *envCount = 0; }
+    int mib[3] = { CTL_KERN, KERN_PROCARGS2, pid };
+    size_t size = 0;
+    if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0 || size < 4) return 0;
+    char *buf = malloc(size);
+    if (!buf) return 0;
+    if (sysctl(mib, 3, buf, &size, NULL, 0) != 0) { free(buf); return 0; }
+
+    uint32_t argc = 0;
+    memcpy(&argc, buf, sizeof argc);
+    size_t p = 4;
+    // skip exec_path (NUL-terminated) and any padding NULs
+    while (p < size && buf[p] != 0) p++;
+    while (p < size && buf[p] == 0) p++;
+    // read argc NUL-terminated argv entries
+    int cap = (int)argc + 4;
+    char **av = malloc((size_t)cap * sizeof *av);
+    int n = 0;
+    for (uint32_t i = 0; i < argc && p < size; i++) {
+        size_t start = p;
+        while (p < size && buf[p] != 0) p++;
+        size_t sl = p - start;
+        char *s = malloc(sl + 1);
+        memcpy(s, buf + start, sl);
+        s[sl] = 0;
+        av[n++] = s;
+        if (p < size) p++; // skip the NUL
+    }
+    *argvOut = av;
+    *argvCount = n;
+
+    if (envOut) {
+        int ecap = 16, en = 0;
+        char **ev = malloc((size_t)ecap * sizeof *ev);
+        while (p < size) {
+            size_t start = p;
+            while (p < size && buf[p] != 0) p++;
+            if (p > start) {
+                if (en == ecap) { ecap *= 2; ev = realloc(ev, (size_t)ecap * sizeof *ev); }
+                size_t sl = p - start;
+                char *s = malloc(sl + 1);
+                memcpy(s, buf + start, sl);
+                s[sl] = 0;
+                ev[en++] = s;
+            }
+            if (p < size) p++;
+        }
+        *envOut = ev;
+        *envCount = en;
+    }
+    free(buf);
+    return 1;
+}
+
+static void freeStrArr(char **v, int n) {
+    if (!v) return;
+    for (int i = 0; i < n; i++) free(v[i]);
+    free(v);
+}
+
+// userOf resolves uid → username (heap; caller frees), falling back to the
+// numeric uid as a string.
+static char *userOf(uint32_t uid) {
+    struct passwd *pw = getpwuid((uid_t)uid);
+    if (pw) return strdup(pw->pw_name);
+    char b[16];
+    snprintf(b, sizeof b, "%u", uid);
+    return strdup(b);
+}
+
+// ─── Depth / ancestry ────────────────────────────────────────────────────────
+
+// pidDepth — same shape as the Linux tracer but silent on bsdInfo failure
+// (non-root tracep on macOS routinely can't introspect other-user processes,
+// and spamming the parent-walk drown actual events).
+static int macPidDepth(int32_t pid) {
+    if (isWatchRoot(pid)) return 0;
+    int32_t  ppid;
+    uint32_t uid;
+    uint64_t sec, usec;
+    if (!bsdInfo(pid, &ppid, &uid, &sec, &usec)) return -1;
+    if (ppid == 0 || ppid == pid) return -1;
+    if (isWatchRoot(ppid)) return 0;
+    macEntry *ent = macdb_find(ppid);
+    if (ent && ent->depth >= 0) return ent->depth + 1;
+    int d = macPidDepth(ppid);
+    if (d < 0) return -1;
+    return d + 1;
+}
+
+// ─── Output (mirrors emitExec in exec_darwin.go) ──────────────────────────────
+
+static void macIndentStr(int depth, char *dst, size_t cap) {
+    if (flatMode || depth <= 0 || cap == 0) { if (cap) dst[0] = 0; return; }
+    size_t w = 0;
+    for (int i = 0; i < depth && w + 2 < cap; i++) {
+        dst[w++] = ' ';
+        dst[w++] = ' ';
+    }
+    dst[w] = 0;
+}
+
+static void macEmitExec(const macEntry *ent) {
+    char indent[1024];
+    macIndentStr(ent->depth, indent, sizeof indent);
+
+    size_t cap = 8192, w = 0;
+    char *sb = malloc(cap);
+#define APPEND(str) do {                                                     \
+        const char *_s = (str); size_t _l = strlen(_s);                      \
+        while (w + _l + 1 > cap) { cap *= 2; sb = realloc(sb, cap); }         \
+        memcpy(sb + w, _s, _l); w += _l; sb[w] = 0;                          \
+    } while (0)
+#define APPEND_CH(ch) do {                                                   \
+        while (w + 2 > cap) { cap *= 2; sb = realloc(sb, cap); }              \
+        sb[w++] = (ch); sb[w] = 0;                                            \
+    } while (0)
+
+    APPEND(indent);
+    char pidstr[16];
+    snprintf(pidstr, sizeof pidstr, "%d", (int)ent->pid);
+    APPEND(c("33", pidstr));
+    if (showExit) APPEND(c("32", "+"));
+
+    if (showUser) {
+        char *name = userOf(ent->uid);
+        char wrapped[300];
+        snprintf(wrapped, sizeof wrapped, " <%s>", name);
+        APPEND(!strcmp(name, "root") ? c("91", wrapped) : c("92", wrapped));
+        free(name);
+    }
+    APPEND_CH(' ');
+
+    if (showCwd) {
+        char *cwd = pidCwd(ent->pid);
+        APPEND(c("35", shquote(cwd)));
+        APPEND(c("2", " % "));
+        free(cwd);
+    }
+
+    char **argv = NULL, **envp = NULL;
+    int argc = 0, envc = 0;
+    pidArgvEnv(ent->pid, &argv, &argc, showEnv ? &envp : NULL,
+               showEnv ? &envc : NULL);
+
+    if (argc == 0) {
+        char *exe = pidPath(ent->pid);
+        if (exe[0] == 0) { free(exe); free(sb); freeStrArr(argv, argc); return; }
+        // basename of exe
+        const char *base = exe;
+        for (char *p = exe; *p; p++)
+            if (*p == '/') base = p + 1;
+        char br[300];
+        snprintf(br, sizeof br, "[%s]", *base ? base : exe);
+        APPEND(c("2", br));
+        free(exe);
+    } else {
+        char *cmd;
+        if (fullPath) {
+            char *exe = pidPath(ent->pid);
+            cmd = strdup(shquote(exe[0] ? exe : argv[0]));
+            free(exe);
+        } else {
+            cmd = strdup(shquote(argv[0]));
+        }
+        APPEND(c("96", cmd));
+        free(cmd);
+        if (showArgs && argc > 1) {
+            for (int i = 1; i < argc; i++) {
+                APPEND_CH(' ');
+                APPEND(c("2", shquote(argv[i])));
+            }
+        }
+    }
+    freeStrArr(argv, argc);
+
+    if (showEnv && envc > 0) {
+        APPEND("\n  ");
+        for (int i = 0; i < envc; i++) {
+            APPEND_CH(' ');
+            const char *e = envp[i];
+            const char *eq = strchr(e, '=');
+            if (eq) {
+                size_t klen = (size_t)(eq - e);
+                char *key = malloc(klen + 1);
+                memcpy(key, e, klen); key[klen] = 0;
+                char *qk = strdup(shquote(key));
+                const char *qv = shquote(eq + 1);
+                size_t need = strlen(qk) + 1 + strlen(qv) + 1;
+                char *joined = malloc(need);
+                snprintf(joined, need, "%s=%s", qk, qv);
+                APPEND(c("2", joined));
+                free(joined); free(qk); free(key);
+            } else {
+                APPEND(c("2", shquote(e)));
+            }
+        }
+    }
+    freeStrArr(envp, envc);
+
+    fprintf(out, "%s\n", sb);
+#undef APPEND
+#undef APPEND_CH
+    free(sb);
+}
+
+static void macEmitExit(const macEntry *ent, struct timeval now) {
+    if (!showExit) return;
+    char indent[1024];
+    macIndentStr(ent->depth, indent, sizeof indent);
+    double startedAt = (double)ent->startSec + (double)ent->startUsec / 1e6;
+    double nowSec    = (double)now.tv_sec   + (double)now.tv_usec   / 1e6;
+    double elapsed   = nowSec - startedAt;
+    if (elapsed < 0) elapsed = 0;
+    const char *cmd = (ent->argv0 && ent->argv0[0]) ? ent->argv0 : "?";
+
+    char pidstr[16], timebuf[32];
+    snprintf(pidstr, sizeof pidstr, "%d", (int)ent->pid);
+    snprintf(timebuf, sizeof timebuf, "time=%.3fs", elapsed);
+
+    char colPid[64], colDash[64], colSt[64], colT[64];
+    snprintf(colPid,  sizeof colPid,  "%s", c("33", pidstr));
+    snprintf(colDash, sizeof colDash, "%s", c("31", "-"));
+    snprintf(colSt,   sizeof colSt,   "%s", c("2",  "status=?"));
+    snprintf(colT,    sizeof colT,    "%s", c("36", timebuf));
+
+    fprintf(out, "%s%s%s %s exited %s %s\n",
+            indent, colPid, colDash,
+            c("2", shquote(cmd)), colSt, colT);
+}
+
+// ─── Polling loop ────────────────────────────────────────────────────────────
+
+// Seed db with everything currently alive so we only report processes
+// that START AFTER tracep does. Matches the Linux behaviour of joining
+// the netlink multicast group "now".
+static void seedMacDB(void) {
+    int32_t *pids = NULL;
+    int n = procListAllPIDs(&pids);
+    for (int i = 0; i < n; i++) {
+        int32_t pid = pids[i];
+        bool created;
+        macEntry *ent = macdb_get(pid, &created);
+        int32_t ppid; uint32_t uid; uint64_t sec, usec;
+        if (!bsdInfo(pid, &ppid, &uid, &sec, &usec)) {
+            ent->depth = -1;
+            continue;
+        }
+        ent->ppid      = ppid;
+        ent->uid       = uid;
+        ent->startSec  = sec;
+        ent->startUsec = usec;
+        ent->depth     = -1; // unknown until proven a descendant of a watch root
+        char **argv = NULL; int argc = 0;
+        pidArgvEnv(pid, &argv, &argc, NULL, NULL);
+        if (argc > 0) ent->argv0 = strdup(argv[0]);
+        freeStrArr(argv, argc);
+    }
+    free(pids);
+}
+
+// One polling tick: list pids, emit exec for those not yet in db, emit
+// exit for those that vanished. Known pids are trusted to be the same
+// process until they leave the pid list — see exec_darwin.go for the
+// rationale on skipping per-tick bsdInfo on known pids.
+static void scanMacDB(void) {
+    int32_t *pids = NULL;
+    int n = procListAllPIDs(&pids);
+    if (n == 0 && !pids) return;
+
+    struct timeval now;
+    gettimeofday(&now, NULL);
+
+    for (int i = 0; i < n; i++) {
+        int32_t pid = pids[i];
+        macEntry *ent = macdb_find(pid);
+        if (ent) {
+            // already known — trust it's the same process
+        } else {
+            // New pid — gather metadata and emit.
+            int32_t  ppid;
+            uint32_t uid;
+            uint64_t sec, usec;
+            bool created;
+            macEntry *ne = macdb_get(pid, &created);
+            if (!bsdInfo(pid, &ppid, &uid, &sec, &usec)) {
+                ne->depth = -1; // record a negative so we don't retry every tick
+                continue;
+            }
+            ne->ppid      = ppid;
+            ne->uid       = uid;
+            ne->startSec  = sec;
+            ne->startUsec = usec;
+            ne->depth     = macPidDepth(pid);
+            char **argv = NULL; int argc = 0;
+            pidArgvEnv(pid, &argv, &argc, NULL, NULL);
+            if (argc > 0) ne->argv0 = strdup(argv[0]);
+            freeStrArr(argv, argc);
+            if (ne->depth >= 0) macEmitExec(ne);
+        }
+    }
+
+    // Sweep db for pids no longer present. Use a hash-keyed liveness
+    // bitmap so the inner check is O(1) ignoring collisions, and verify
+    // with a linear scan of pids[] on a hit to rule those out — pids[]
+    // is a few hundred entries so this is cheap.
+    static char *liveBitmap;
+    if (!liveBitmap) liveBitmap = malloc(MACDB_CAP);
+    memset(liveBitmap, 0, MACDB_CAP);
+    for (int i = 0; i < n; i++) liveBitmap[macdb_hash(pids[i])] = 1;
+
+    int32_t goners[1024];
+    int      ng = 0;
+    for (int i = 0; i < MACDB_CAP && ng < (int)(sizeof goners / sizeof goners[0]); i++) {
+        macEntry *e = &macDB[i];
+        if (!e->used) continue;
+        if (liveBitmap[macdb_hash(e->pid)]) {
+            bool found = false;
+            for (int k = 0; k < n; k++) if (pids[k] == e->pid) { found = true; break; }
+            if (found) continue;
+        }
+        goners[ng++] = e->pid;
+    }
+    for (int i = 0; i < ng; i++) {
+        macEntry *e = macdb_find(goners[i]);
+        if (!e) continue;
+        if (e->depth >= 0) macEmitExit(e, now);
+        macdb_delete(goners[i]);
+    }
+    free(pids);
+}
+
+// ─── CMD-mode child reaping ───────────────────────────────────────────────────
+
+static pid_t                  g_macChild;
+static volatile sig_atomic_t  g_macChildExited;
+
+static void mac_on_child(int s) {
+    (void)s;
+    int st;
+    pid_t r;
+    while ((r = waitpid(-1, &st, WNOHANG)) > 0) {
+        if (r == g_macChild) g_macChildExited = 1;
+    }
+}
+
+// ─── Usage ────────────────────────────────────────────────────────────────────
+
+static void macUsage(void) {
+    const char *bold    = "\033[1m";
+    const char *dim     = "\033[2m";
+    const char *reset   = "\033[0m";
+    const char *cyan    = "\033[36m";
+    const char *yellow  = "\033[33m";
+    const char *green   = "\033[32m";
+    const char *magenta = "\033[35m";
+    FILE *e = stderr;
+    fprintf(e, "\n  %s%s🔍 tracep exec%s %s%s%s — exec() tracer (darwin, polling)\n\n",
+            bold, cyan, reset, dim, tracep_version, reset);
+    fprintf(e, "  %sUsage:%s\n", bold, reset);
+    fprintf(e, "    tracep exec %s[flags]%s %s[-p PID[,PID,...] | CMD...]%s\n\n",
+            dim, reset, yellow, reset);
+    fprintf(e, "  %sFlags:%s\n", bold, reset);
+    fprintf(e, "    🎨  %s-c%s          colorize output %s(auto when stdout is a tty)%s\n", yellow, reset, dim, reset);
+    fprintf(e, "    📁  %s-d%s          print cwd of each process\n", yellow, reset);
+    fprintf(e, "    🌿  %s-e%s          print environment variables\n", yellow, reset);
+    fprintf(e, "    ⬜  %s-f%s          flat output %s(no indentation)%s\n", yellow, reset, dim, reset);
+    fprintf(e, "    ⏲️   %s-i%s %sMS%s        poll interval in ms %s(default 50)%s\n", yellow, reset, cyan, reset, dim, reset);
+    fprintf(e, "    🔗  %s-l%s          print full executable path\n", yellow, reset);
+    fprintf(e, "    📝  %s-o%s %sFILE%s      log output to FILE instead of stdout\n", yellow, reset, cyan, reset);
+    fprintf(e, "    🎯  %s-p%s %sPID%s       trace descendants of PID %s(repeat or comma-separate)%s\n", yellow, reset, cyan, reset, dim, reset);
+    fprintf(e, "    🤫  %s-q%s          suppress arguments\n", yellow, reset);
+    fprintf(e, "    🔇  %s-Q%s          suppress error messages\n", yellow, reset);
+    fprintf(e, "    ⏱️   %s-t%s          show exit + timing %s(exit code unknown on darwin)%s\n", yellow, reset, dim, reset);
+    fprintf(e, "    👤  %s-u%s          print owning user\n", yellow, reset);
+    fprintf(e, "\n  %sNotes:%s\n", bold, reset);
+    fprintf(e, "    %sdarwin has no equivalent of Linux's proc connector. This build polls%s\n", dim, reset);
+    fprintf(e, "    %sproc_listallpids and diffs snapshots — processes that exec+exit inside%s\n", dim, reset);
+    fprintf(e, "    %sone interval are missed. Lower -i for finer-grained coverage at higher CPU.%s\n\n", dim, reset);
+    fprintf(e, "  %sExamples:%s\n", bold, reset);
+    fprintf(e, "    %s# trace a command and all its children%s\n", dim, reset);
+    fprintf(e, "    tracep exec %s-ct%s sh -c %s'make'%s\n\n", green, reset, magenta, reset);
+    fprintf(e, "    %s# 20ms polling, log to file%s\n", dim, reset);
+    fprintf(e, "    tracep exec %s-i 20 -Qo%s /tmp/execs.log\n\n", green, reset);
+    exit(1);
+}
+
+// ─── main ────────────────────────────────────────────────────────────────────
+
+int exec_main(int argc, char **argv) {
+    out = stdout;
+
+    char **cmdArgs = NULL;
+    int    nCmdArgs = 0;
+    const char *outFile = NULL;
+
+    int nargs = argc - 1;
+    char **args = argv + 1;
+
+    for (int i = 0; i < nargs; i++) {
+        char *a = args[i];
+        if (strlen(a) < 2 || a[0] != '-') {
+            cmdArgs  = &args[i];
+            nCmdArgs = nargs - i;
+            break;
+        }
+        for (char *pch = a + 1; *pch; pch++) {
+            char ch = *pch;
+            switch (ch) {
+            case 'c': colorForce = true; break;
+            case 'd': showCwd    = true; break;
+            case 'e': showEnv    = true; break;
+            case 'f': flatMode   = true; break;
+            case 'l': fullPath   = true; break;
+            case 'q': showArgs   = false; break;
+            case 'Q': showErrors = false; break;
+            case 't': showExit   = true; break;
+            case 'u': showUser   = true; break;
+            case 'p': {
+                if (i + 1 >= nargs) fatal("flag -p requires an argument");
+                i++;
+                char *dup = strdup(args[i]);
+                char *save = NULL;
+                for (char *s = strtok_r(dup, ",", &save); s;
+                     s = strtok_r(NULL, ",", &save)) {
+                    while (*s == ' ' || *s == '\t') s++;
+                    size_t L = strlen(s);
+                    while (L && (s[L - 1] == ' ' || s[L - 1] == '\t' ||
+                                 s[L - 1] == '\n' || s[L - 1] == '\r'))
+                        s[--L] = 0;
+                    if (L == 0) continue;
+                    char *end;
+                    errno = 0;
+                    long pid = strtol(s, &end, 10);
+                    if (end == s || *end != 0 || errno != 0 || pid <= 0)
+                        fatalf("-p: invalid PID: %s", s);
+                    if (kill((pid_t)pid, 0) != 0 && errno == ESRCH)
+                        fatalf("-p %d: no such process", (int)pid);
+                    if (nWatchPIDs < (int)(sizeof watchPIDs / sizeof watchPIDs[0]))
+                        watchPIDs[nWatchPIDs++] = (int32_t)pid;
+                }
+                free(dup);
+                break;
+            }
+            case 'o':
+                if (i + 1 >= nargs) fatal("flag -o requires an argument");
+                i++;
+                outFile = args[i];
+                break;
+            case 'i':
+                if (i + 1 >= nargs) fatal("flag -i requires an argument (poll interval in ms)");
+                i++;
+                {
+                    char *end; errno = 0;
+                    long v = strtol(args[i], &end, 10);
+                    if (end == args[i] || *end != 0 || errno != 0 || v <= 0)
+                        fatalf("-i: invalid interval: %s", args[i]);
+                    pollIntervalMs = (int)v;
+                }
+                break;
+            case 'h':
+                macUsage();
+                break;
+            default:
+                fatalf("unknown flag -%c", ch);
+            }
+        }
+    }
+
+    if (nWatchPIDs == 0) {
+        watchPIDs[0] = 1;
+        nWatchPIDs   = 1;
+    }
+    if (outFile && outFile[0] != 0) {
+        FILE *f = fopen(outFile, "a");
+        if (!f) fatalf("open %s: %s", outFile, strerror(errno));
+        out = f;
+    }
+    if (colorForce) colorMode = true;
+    else if (getenv("NO_COLOR") == NULL) colorMode = is_terminal(out);
+
+    // CMD mode: fork the command and watch its subtree.
+    if (nCmdArgs > 0) {
+        nWatchPIDs   = 1;
+        watchPIDs[0] = (int32_t)getpid();
+
+        struct sigaction act;
+        memset(&act, 0, sizeof act);
+        act.sa_handler = mac_on_child;
+        sigemptyset(&act.sa_mask);
+        act.sa_flags = SA_RESTART;
+        sigaction(SIGCHLD, &act, NULL);
+
+        pid_t pid = fork();
+        if (pid < 0) fatalf("exec %s: %s", cmdArgs[0], strerror(errno));
+        if (pid == 0) {
+            char **cargv = malloc((size_t)(nCmdArgs + 1) * sizeof *cargv);
+            for (int k = 0; k < nCmdArgs; k++) cargv[k] = cmdArgs[k];
+            cargv[nCmdArgs] = NULL;
+            execvp(cargv[0], cargv);
+            fprintf(stderr, "tracep exec: exec %s: %s\n",
+                    cmdArgs[0], strerror(errno));
+            _exit(1);
+        }
+        g_macChild = pid;
+    }
+
+    seedMacDB();
+
+    // Banner: same shape as the Go tracer.
+    if (showErrors) {
+        if (geteuid() != 0)
+            fprintf(stderr, "tracep exec: polling at %dms on darwin — short-lived processes may be missed; non-root sees argv only for own-user processes\n",
+                    pollIntervalMs);
+        else
+            fprintf(stderr, "tracep exec: polling at %dms on darwin — short-lived processes may be missed\n",
+                    pollIntervalMs);
+    }
+
+    struct timespec interval = {
+        .tv_sec  = pollIntervalMs / 1000,
+        .tv_nsec = (long)(pollIntervalMs % 1000) * 1000000L,
+    };
+    for (;;) {
+        if (g_macChildExited) exit(0);
+        nanosleep(&interval, NULL);
+        scanMacDB();
+    }
+}
+
+#else // ── non-Linux, non-darwin stub ──────────────────────────────────────────
 
 int exec_main(int argc, char **argv) {
     (void)argc;
     (void)argv;
-#if defined(__APPLE__)
-    const char *os = "darwin";
-#elif defined(__FreeBSD__)
+#if defined(__FreeBSD__)
     const char *os = "freebsd";
 #elif defined(__OpenBSD__)
     const char *os = "openbsd";
@@ -991,7 +1719,7 @@ int exec_main(int argc, char **argv) {
     const char *os = "unknown";
 #endif
     fprintf(stderr,
-            "tracep exec: exec() tracing is only supported on Linux (this is %s).\n"
+            "tracep exec: exec() tracing is only supported on Linux and macOS (this is %s).\n"
             "Only `tracep ca` and `tracep dns` run on %s.\n",
             os, os);
     return 1;
