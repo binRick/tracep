@@ -5,24 +5,39 @@ Trace a process's network, TLS, DNS, and exec activity — one self-contained Go
 `tracep` unifies five previously-separate tools into a single zero-dependency
 (stdlib-only) binary with a subcommand per tracer:
 
-| Command | What it traces | Mechanism | Linux | macOS |
-|---|---|---|:--:|:--:|
-| `tracep net`  | per-process network connections | netlink socket diag + `/proc` | ✅ | ❌ |
-| `tracep tls`  | per-process TLS reads/writes & SNI | `libssl` uprobes | ✅ | ❌ |
-| `tracep dns`  | per-process DNS queries & answers | `AF_PACKET` (Linux) / BPF (macOS) | ✅ | ✅¹ |
-| `tracep exec` | per-process `exec()` syscalls | netlink proc connector (Linux) / `proc_listallpids` poll (macOS) | ✅ | ✅² |
-| `tracep ca`   | a host's TLS CA certificate chain | outbound TLS dial | ✅ | ✅ |
+| Command | What it traces | Mechanism | Linux | macOS | `-p PID` |
+|---|---|---|:--:|:--:|:--:|
+| `tracep net`  | per-process network connections | netlink socket diag + `/proc` (Linux) / `lsof -i` poll (macOS) | ✅ | ✅² | ✅ |
+| `tracep tls`  | per-process TLS reads/writes & SNI | `libssl` uprobes | ✅ | ❌ | Linux |
+| `tracep dns`  | per-process DNS queries & answers | `AF_PACKET` (Linux) / BPF + `lsof -iUDP` poll (macOS) | ✅ | ✅¹ | ✅ |
+| `tracep exec` | per-process `exec()` syscalls | netlink proc connector (Linux) / `proc_listallpids` poll (macOS) | ✅ | ✅³ | ✅ |
+| `tracep ca`   | a host's TLS CA certificate chain | outbound TLS dial | ✅ | ✅ | n/a |
 
-¹ macOS `dns` captures via `/dev/bpf` and shows queries **without** process
-attribution (pid `0`, name `?`) — there is no portable socket→PID map off
-Linux. On macOS, `net`/`tls` exit immediately with a clear "Linux-only"
-message; the binary still builds and runs everywhere.
+¹ macOS `dns` captures every query via `/dev/bpf` and now attributes them
+to PIDs by mapping local UDP ports → owning PID via `lsof -nP -iUDP`
+(cached for 2 s). Without root, attribution is limited to the invoker's
+own-user sockets — same constraint as `lsof` itself. `-p PID,...` filters
+to specific processes; queries from other PIDs are still captured but
+suppressed.
 
-² macOS `exec` polls `proc_listallpids` every 50 ms (override with `-i
+² macOS `net` polls `lsof -nP -i` every 1 s (override with `-i MS`) and
+diffs snapshots to detect new connections. With `-p PID,...` lsof runs
+server-side filtered for that PID, so the per-tick cost stays small.
+Short-lived connections that open+close inside one interval are missed —
+the polling tradeoff vs Linux's event-driven netlink conntrack. The
+Linux-only flags `-t/-U/-r/-4/-6/-O` parse on macOS as no-ops for command
+compatibility.
+
+³ macOS `exec` polls `proc_listallpids` every 50 ms (override with `-i
 MS`). Reliably catches any process living longer than the interval;
 *misses* shorter-lived processes — for those you'd need Apple's
 EndpointSecurity framework with an entitlement (or partial-SIP DTrace).
 Works without root for own-user processes; root sees every process.
+
+`tracep tls` remains Linux-only — the macOS equivalent would need
+EndpointSecurity (uprobes against system libraries are blocked by SIP).
+On macOS it exits immediately with a clear "Linux-only" message; the
+binary still builds and runs everywhere.
 
 Each subcommand keeps the exact flags and behaviour of its original
 `proc-trace-*` / `tls-ca-fetch` tool — run `tracep <command> -h` for details.
@@ -41,12 +56,13 @@ make darwin     # cross-compile macOS amd64 + arm64 into dist/
 One Makefile drives both implementations; the Go cross-compile/release
 targets are Go-only and unchanged.
 
-The binary builds and runs on Linux and macOS. The Linux-only tracers
-(`net`/`tls`) are gated behind `//go:build linux`; on macOS they are
-present but exit with a Linux-only message. `ca`, `dns` (BPF), and
-`exec` (polling) work natively on macOS. Pure-stdlib Go — `exec` calls
-Apple's `proc_info` syscall via `syscall.Syscall6`, no cgo, no extra
-deps — so it still cross-compiles from any platform.
+The binary builds and runs on Linux and macOS. Only `tls` remains
+Linux-only (gated behind `//go:build linux`); on macOS it exits with a
+clear message. `ca`, `dns` (BPF + lsof PID map), `exec` (proc_info
+polling), and `net` (lsof polling) all work natively on macOS. Pure
+stdlib Go — `exec` calls Apple's `proc_info` syscall via
+`syscall.Syscall6`, `dns`/`net` shell out to the system `lsof`, no cgo
+and no extra deps. Cross-compiles from any platform.
 
 There are **two implementations** — the reference Go binary and a
 behaviour-identical C port in `c/` — compared in detail under
@@ -61,7 +77,9 @@ sudo tracep dns -j | jq .    # DNS as line-delimited JSON
 sudo tracep exec             # every exec() across the system
 tracep ca example.com -o -   # dump example.com's CA chain as PEM
 
-sudo tracep dns              # macOS: same, via /dev/bpf (no PID column)
+sudo tracep dns              # macOS: same, via /dev/bpf; lsof resolves PIDs
+sudo tracep dns -p 1234      # macOS: filter to PID 1234 (lsof socket map)
+tracep net -p 1844 -c        # macOS: poll lsof every 1s for firefox's sockets
 tracep ca example.com        # macOS: works natively, no privileges
 ```
 
@@ -75,15 +93,34 @@ All samples below are real output captured on a live Linux host
 
 ### `tracep net` — connection attribution
 
-Reads the kernel socket table via netlink and joins each socket back to its
-owning PID/command through `/proc/<pid>/fd`. You see **who** talked to
-**where**, the L4 protocol, and the direction of the flow:
+On **Linux**, reads the kernel socket table via netlink and joins each
+socket back to its owning PID/command through `/proc/<pid>/fd`. You see
+**who** talked to **where**, the L4 protocol, and the direction of the
+flow:
 
 ```
   930 dockerd      UDP  172.238.205.61:55189     → 172.233.160.27:53
     ? ?            TCP  47.128.20.131:57804      ← 172.238.205.61:443
     ? ?            TCP  172.18.0.9:54672         ↔ 35.194.67.18:443
 ```
+
+On **macOS** the same subcommand polls `lsof -nP -i` every 1 s (override
+with `-i MS`) and diffs against the previous snapshot. With `-p PID,...`
+lsof is invoked server-side-filtered so only the watched processes'
+sockets are enumerated:
+
+```
+$ tracep net -i 250 -p $(pgrep firefox)
+   1844 firefox      TCP  192.168.1.242:54719            → 172.238.205.61:443
+   1844 firefox      UDP  *:55361                        • *:0
+   1844 firefox      TCP  [2603:9000:6ff0:8cd0:4b5:d7d:90a2:947a]:54720 → [2600:1901:0:179c::]:443
+```
+
+Tradeoffs vs the Linux backend: connections that open+close inside one
+poll interval are missed, kernel state labels (`ESTAB`/`TIME_WAIT`) and
+direction arrows (`←`/`↔`) aren't available, and the Linux-only flags
+`-t/-U/-r/-4/-6/-O` are accepted as no-ops so the same command lines
+work either way.
 
 - `→` outbound, `←` inbound, `↔` established both-ways.
 - `? ?` means the socket had no resolvable owner at capture time (kernel
@@ -114,13 +151,20 @@ The probe count depends on which `libssl` symbols are present on the host.
 
 ### `tracep dns` — query attribution and timing
 
-Opens a raw `AF_PACKET` socket, parses DNS on the wire, and matches each
-response back to its request to compute latency:
+Opens a raw `AF_PACKET` socket (Linux) or `/dev/bpf` (macOS), parses DNS
+on the wire, and matches each response back to its request to compute
+latency:
 
 ```
 0        ?                A      example.com        → 172.66.147.243 104.20.23.154  41.8ms
 0        ?                A      github.com         → 140.82.113.3  0.1ms
 ```
+
+On **Linux** the PID/name come from `/proc/net/udp` socket→inode→PID;
+on **macOS** the same data comes from a cached `lsof -nP -iUDP` scan (2 s
+TTL) so DNS queries are now attributed there too. `-p PID,...` filters
+to specific processes on both platforms — non-matching queries are still
+captured but suppressed from output.
 
 Columns: PID, command, record type, queried name, answers, round-trip time.
 With `-j` it emits one JSON object per query — ideal for piping to `jq` or
@@ -303,18 +347,19 @@ The suite is OS-aware:
 
 - **Linux** — all six suites run; the four live tracers need root (skip,
   don't fail, otherwise).
-- **macOS** — `01_dispatch` and `02_ca` run fully; `net`/`tls` switch to
-  a **stub assertion** (must exit non-zero with the Linux-only message);
-  `05_dns` runs its `-h` regression everywhere and its live BPF capture
-  when run as root (skips otherwise); `06_exec` runs the cross-platform
-  live capture and, additionally on macOS non-root, asserts the polling
-  backend is wired in (no Linux-only stub, no panic).
+- **macOS** — `01_dispatch` and `02_ca` run fully; only `tls` switches
+  to a **stub assertion** (must exit non-zero with the Linux-only
+  message); `05_dns` runs its `-h` regression everywhere and its live
+  BPF capture when run as root (skips otherwise); `03_net` and `06_exec`
+  run the cross-platform live capture and, additionally on macOS
+  non-root, assert that the polling backends are wired in (no Linux-only
+  stub, no panic).
 - Other OSes — live suites skip with a clear message.
 
 Latest runs (**both implementations**, same black-box suite): **54/54
-green** on Linux 6.12 x86-64; **42/42 green** on macOS (arm64,
-unprivileged — dns BPF capture and live exec skipped without root; the
-darwin sanity check still runs).
+green** on Linux 6.12 x86-64; **41/41 green** on macOS (arm64,
+unprivileged — dns BPF capture and live net/exec skipped without root;
+the darwin sanity checks still run).
 
 ## Two implementations: Go and C
 
@@ -324,9 +369,10 @@ re-implementation — same flags, same output, same ANSI/emoji, same error
 text — that passes the *identical* black-box test suite (54/54 Linux,
 43/43 macOS). Build the C version with `cd c && make`.
 
-Both make the same platform trade-offs: `net`/`tls` are Linux-only
-(stub out elsewhere), `dns` adds a macOS `/dev/bpf` backend, `exec`
-adds a macOS `proc_listallpids`-polling backend, `ca` is cross-platform.
+Both make the same platform trade-offs: `tls` is Linux-only (stubs out
+elsewhere); `net` and `dns` use polling backends on macOS (`lsof`-based,
+with the same `-p PID` filtering as the Linux versions); `exec` polls
+`proc_listallpids` on macOS; `ca` is cross-platform.
 
 ### Lines of code
 
@@ -422,12 +468,12 @@ Go's runtime + GC heap.)
 
 #### macOS (this host, 26.2 arm64)
 
-`ca`, `dns`, and `exec` run natively on macOS; `net` and `tls` are
-Linux-only stubs (print the message and exit instantly), `dns`'s
-`/dev/bpf` capture needs root (skipped unprivileged, as in the suite),
-and `exec` polls `proc_listallpids` (50 ms default; the Linux
-proc-connector path is event-driven). `ca` is the representative
-cross-platform throughput workload:
+`ca`, `dns`, `exec`, and `net` run natively on macOS; only `tls` is a
+Linux-only stub (prints the message and exits instantly). `dns`'s
+`/dev/bpf` capture needs root, `exec` polls `proc_listallpids` every
+50 ms, and `net` polls `lsof -nP -i` every 1 s — all three accept `-p
+PID` and the dns/net ones additionally use `lsof` per scan to resolve
+PIDs. `ca` is the representative one-shot throughput workload:
 
 | | Binary size | `ca` wall/fetch | `ca` CPU/fetch | `ca` peak RSS |
 |---|---:|---:|---:|---:|
@@ -479,20 +525,20 @@ only dispatches.
 
 | Language | Files | Lines | Blanks | Comments | Code | Complexity |
 |---|---|---|---|---|---|---|
-| Go | 18 | 4,892 | 537 | 389 | 3,966 | 1,060 |
-| Shell | 11 | 571 | 66 | 101 | 404 | 102 |
-| C | 7 | 5,495 | 546 | 401 | 4,548 | 1,512 |
+| Go | 20 | 5,502 | 582 | 477 | 4,443 | 1,190 |
+| Shell | 11 | 591 | 68 | 111 | 412 | 104 |
+| C | 7 | 5,948 | 571 | 424 | 4,953 | 1,641 |
 | Makefile | 2 | 137 | 22 | 30 | 85 | 7 |
-| Markdown | 2 | 504 | 108 | 0 | 396 | 0 |
+| Markdown | 2 | 550 | 114 | 0 | 436 | 0 |
 | C Header | 1 | 46 | 8 | 20 | 18 | 0 |
 | Python | 1 | 23 | 3 | 4 | 16 | 3 |
 | YAML | 1 | 24 | 0 | 2 | 22 | 0 |
-| **Total** | **43** | **11,692** | **1,290** | **947** | **9,455** | **2,684** |
+| **Total** | **45** | **12,821** | **1,368** | **1,068** | **10,385** | **2,945** |
 
-- **Estimated Cost to Develop (organic):** $285,785
-- **Estimated Schedule Effort (organic):** 8.54 months
-- **Estimated People Required (organic):** 2.97
-- **Processed:** 391,885 bytes (0.392 megabytes)
+- **Estimated Cost to Develop (organic):** $315,371
+- **Estimated Schedule Effort (organic):** 8.87 months
+- **Estimated People Required (organic):** 3.16
+- **Processed:** 430,764 bytes (0.431 megabytes)
 
 *Generated with [scc](https://github.com/boyter/scc) on 2026-05-26*
 <!-- scc-end -->

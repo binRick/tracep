@@ -17,15 +17,405 @@
 #include <string.h>
 #include <unistd.h>
 
-// ─── Non-Linux stub (net_other.go) ───────────────────────────────────────────
-#if !defined(__linux__)
+// ─── macOS polling backend (mirror of net_darwin.go) ────────────────────────
+#if defined(__APPLE__)
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <time.h>
+
+static int32_t  net_watchPIDs[256];
+static int      net_nWatchPIDs;
+static bool     net_colorMode, net_colorForce, net_showUser;
+static bool     net_showErrors  = true;
+static FILE    *net_out;
+static int      net_pollIntervalMs = 1000;
+
+// Open-addressing hash of "seen this connection" keys. Capacity is a
+// power of two; ~10k connections is plenty for a developer-laptop view.
+typedef struct {
+    bool     used;
+    uint32_t hash;
+    int      pid;
+    char     proto[8];   // "TCP" / "UDP"
+    char     src[64];
+    int      sport;
+    char     dst[64];
+    int      dport;
+} net_seen_ent;
+#define NETSEEN_CAP 16384
+static net_seen_ent net_seen[NETSEEN_CAP];
+
+static uint32_t net_hash(const char *proto, int pid, const char *src, int sport,
+                         const char *dst, int dport) {
+    uint64_t h = 1469598103934665603ULL; // FNV-64 offset basis
+    for (const char *p = proto; *p; p++) { h ^= (uint8_t)*p; h *= 1099511628211ULL; }
+    h ^= (uint64_t)(uint32_t)pid; h *= 1099511628211ULL;
+    for (const char *p = src; *p; p++) { h ^= (uint8_t)*p; h *= 1099511628211ULL; }
+    h ^= (uint64_t)(uint32_t)sport; h *= 1099511628211ULL;
+    for (const char *p = dst; *p; p++) { h ^= (uint8_t)*p; h *= 1099511628211ULL; }
+    h ^= (uint64_t)(uint32_t)dport; h *= 1099511628211ULL;
+    return (uint32_t)h;
+}
+
+// Returns true if already seen; otherwise inserts and returns false.
+static bool net_seen_check_insert(uint32_t hash, int pid, const char *proto,
+                                  const char *src, int sport,
+                                  const char *dst, int dport) {
+    unsigned i = hash & (NETSEEN_CAP - 1);
+    for (unsigned probe = 0; probe < NETSEEN_CAP; probe++) {
+        net_seen_ent *e = &net_seen[(i + probe) & (NETSEEN_CAP - 1)];
+        if (!e->used) {
+            e->used = true;
+            e->hash = hash;
+            e->pid  = pid;
+            snprintf(e->proto, sizeof e->proto, "%s", proto);
+            snprintf(e->src,   sizeof e->src,   "%s", src);
+            e->sport = sport;
+            snprintf(e->dst,   sizeof e->dst,   "%s", dst);
+            e->dport = dport;
+            return false;
+        }
+        if (e->hash == hash && e->pid == pid && e->sport == sport && e->dport == dport
+            && !strcmp(e->proto, proto) && !strcmp(e->src, src) && !strcmp(e->dst, dst))
+            return true;
+    }
+    return true; // table full — pretend seen
+}
+
+static const char *net_c(const char *code, const char *s) {
+    return clr(net_colorMode, code, s);
+}
+
+static void net_fatalf(const char *f, ...) {
+    fputs("tracep net: ", stderr);
+    va_list ap;
+    va_start(ap, f);
+    vfprintf(stderr, f, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    exit(1);
+}
+static void net_fatal(const char *m) {
+    fprintf(stderr, "tracep net: %s\n", m);
+    exit(1);
+}
+
+// split_conn — "src->dst" → (src, dst); listening sockets have no arrow.
+static void split_conn(const char *body, char *src, size_t srcsz,
+                       char *dst, size_t dstsz) {
+    const char *arrow = strstr(body, "->");
+    if (arrow) {
+        size_t L = (size_t)(arrow - body);
+        if (L >= srcsz) L = srcsz - 1;
+        memcpy(src, body, L); src[L] = 0;
+        snprintf(dst, dstsz, "%s", arrow + 2);
+    } else {
+        snprintf(src, srcsz, "%s", body);
+        dst[0] = 0;
+    }
+}
+
+// split_host_port — "[::1]:443", "127.0.0.1:80", "*:53", "*:*".
+static void split_host_port(const char *s, char *ip, size_t ipsz, int *port) {
+    *port = 0;
+    ip[0] = 0;
+    if (!s || !*s || !strcmp(s, "*:*")) return;
+    if (s[0] == '[') {
+        const char *end = strstr(s, "]:");
+        if (!end) return;
+        size_t L = (size_t)(end - s - 1);
+        if (L >= ipsz) L = ipsz - 1;
+        memcpy(ip, s + 1, L); ip[L] = 0;
+        *port = atoi(end + 2);
+        return;
+    }
+    const char *colon = strrchr(s, ':');
+    if (!colon) { snprintf(ip, ipsz, "%s", s); return; }
+    size_t L = (size_t)(colon - s);
+    if (L >= ipsz) L = ipsz - 1;
+    memcpy(ip, s, L); ip[L] = 0;
+    if (!strcmp(ip, "*")) ip[0] = 0;
+    if (colon[1] != '*') *port = atoi(colon + 1);
+}
+
+// join_host_port — bracket IPv6 literals so "::1:443" isn't ambiguous.
+static void join_host_port(const char *ip, int port, char *out, size_t cap) {
+    bool isV6 = strchr(ip, ':') != NULL;
+    if (!*ip)     snprintf(out, cap, "*:%d", port);
+    else if (isV6) snprintf(out, cap, "[%s]:%d", ip, port);
+    else           snprintf(out, cap, "%s:%d", ip, port);
+}
+
+// lsof_argv builds the argv for an lsof child. Returns the count.
+static int lsof_argv(char **argv, int max) {
+    int n = 0;
+    if (n + 8 > max) return 0;
+    argv[n++] = "/usr/sbin/lsof";
+    argv[n++] = "-nP";
+    argv[n++] = "-i";
+    argv[n++] = "-F";
+    argv[n++] = "pcLPn";
+    if (net_nWatchPIDs > 0) {
+        static char pidlist[2048];
+        size_t w = 0;
+        for (int i = 0; i < net_nWatchPIDs; i++) {
+            if (i) pidlist[w++] = ',';
+            int r = snprintf(pidlist + w, sizeof pidlist - w, "%d", (int)net_watchPIDs[i]);
+            if (r < 0 || w + (size_t)r >= sizeof pidlist) break;
+            w += (size_t)r;
+        }
+        pidlist[w] = 0;
+        argv[n++] = "-p";
+        argv[n++] = pidlist;
+    }
+    argv[n] = NULL;
+    return n;
+}
+
+static void net_emit(int pid, const char *comm, const char *proto,
+                     const char *src, int sport,
+                     const char *dst, int dport) {
+    char buf[512];
+    fprintf(net_out, "%7d ", pid);
+    const char *cm = (comm && *comm) ? comm : "?";
+    char trimmed[16];
+    snprintf(trimmed, sizeof trimmed, "%-12.12s", cm);
+    fprintf(net_out, "%s", net_c("96", trimmed));
+    fputc(' ', net_out);
+    snprintf(buf, sizeof buf, "%-4s", proto);
+    fprintf(net_out, "%s ", net_c("2", buf));
+    char srcp[80], dstp[80];
+    join_host_port(src, sport, srcp, sizeof srcp);
+    join_host_port(dst, dport, dstp, sizeof dstp);
+    char col[96];
+    snprintf(col, sizeof col, "%-30s", srcp);
+    fprintf(net_out, "%s ", net_c("32", col));
+    if (!*dst && dport == 0) fprintf(net_out, "%s ", net_c("2", "•"));
+    else                     fprintf(net_out, "%s ", net_c("36", "→"));
+    snprintf(col, sizeof col, "%-30s", dstp);
+    fprintf(net_out, "%s\n", net_c("33", col));
+}
+
+// net_scan forks lsof, parses -F pcLPn output, and emits any new connection.
+static void net_scan(bool seedOnly) {
+    char *argv_lsof[16];
+    int nargs = lsof_argv(argv_lsof, 16);
+    if (nargs == 0) return;
+    int pipefd[2];
+    if (pipe(pipefd) < 0) return;
+    pid_t pid = fork();
+    if (pid < 0) { close(pipefd[0]); close(pipefd[1]); return; }
+    if (pid == 0) {
+        close(pipefd[0]);
+        dup2(pipefd[1], 1);
+        close(pipefd[1]);
+        int devnull = open("/dev/null", O_WRONLY);
+        if (devnull >= 0) { dup2(devnull, 2); close(devnull); }
+        execv(argv_lsof[0], argv_lsof);
+        _exit(127);
+    }
+    close(pipefd[1]);
+    FILE *r = fdopen(pipefd[0], "r");
+    if (!r) { close(pipefd[0]); waitpid(pid, NULL, 0); return; }
+
+    int  cur_pid = 0;
+    char cur_comm[64] = "?";
+    char cur_proto[8] = "";
+    char line[4096];
+    while (fgets(line, sizeof line, r)) {
+        size_t L = strlen(line);
+        while (L > 0 && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
+        if (L < 2) continue;
+        switch (line[0]) {
+        case 'p':
+            cur_pid = atoi(line + 1);
+            cur_proto[0] = 0; // new process — clear stale per-fd state
+            break;
+        case 'c':
+            snprintf(cur_comm, sizeof cur_comm, "%s", line + 1);
+            break;
+        case 'f':
+            cur_proto[0] = 0; // new fd — clear so non-network fds are skipped
+            break;
+        case 'P':
+            snprintf(cur_proto, sizeof cur_proto, "%s", line + 1);
+            break;
+        case 'n': {
+            // `-p PID` lsof also lists non-network fds (files, UNIX
+            // sockets) — those start with '/'. cur_proto stays empty
+            // when there was no preceding `P` line for this fd.
+            const char *body = line + 1;
+            if (!*body || *body == '/' || !cur_proto[0]) break;
+            char src[64], dst[64], sip[64], dip[64];
+            int sport, dport;
+            split_conn(body, src, sizeof src, dst, sizeof dst);
+            split_host_port(src, sip, sizeof sip, &sport);
+            split_host_port(dst, dip, sizeof dip, &dport);
+            uint32_t h = net_hash(cur_proto, cur_pid, sip, sport, dip, dport);
+            bool already = net_seen_check_insert(h, cur_pid, cur_proto, sip, sport, dip, dport);
+            if (already || seedOnly) break;
+            net_emit(cur_pid, cur_comm, cur_proto, sip, sport, dip, dport);
+            break;
+        }
+        }
+    }
+    fclose(r);
+    waitpid(pid, NULL, 0);
+}
+
+static void net_usage(void) {
+    const char *bold    = "\033[1m";
+    const char *dim     = "\033[2m";
+    const char *reset   = "\033[0m";
+    const char *cyan    = "\033[36m";
+    const char *yellow  = "\033[33m";
+    const char *green   = "\033[32m";
+    const char *magenta = "\033[35m";
+    FILE *e = stderr;
+    fprintf(e, "\n  %s%s🌐 tracep net%s %s%s%s — network-connection tracer (darwin, polling)\n\n",
+            bold, cyan, reset, dim, tracep_version, reset);
+    fprintf(e, "  %sUsage:%s\n", bold, reset);
+    fprintf(e, "    tracep net %s[flags]%s %s[-p PID[,PID,...] | CMD...]%s\n\n",
+            dim, reset, yellow, reset);
+    fprintf(e, "  %sFlags:%s\n", bold, reset);
+    fprintf(e, "    🎨  %s-c%s          colorize output\n", yellow, reset);
+    fprintf(e, "    ⏲️   %s-i%s %sMS%s        poll interval in ms %s(default 1000)%s\n", yellow, reset, cyan, reset, dim, reset);
+    fprintf(e, "    📝  %s-o%s %sFILE%s      log output to FILE\n", yellow, reset, cyan, reset);
+    fprintf(e, "    🎯  %s-p%s %sPID%s       filter to descendants of PID\n", yellow, reset, cyan, reset);
+    fprintf(e, "    👤  %s-u%s          print owning user (informational only)\n", yellow, reset);
+    fprintf(e, "    🔇  %s-Q%s          suppress error messages\n", yellow, reset);
+    fprintf(e, "    %s-t/-U/-r/-4/-6/-O recognized for Linux compatibility (no-op on darwin)%s\n", dim, reset);
+    fprintf(e, "\n  %sNotes:%s\n", bold, reset);
+    fprintf(e, "    %sdarwin has no netlink conntrack. This build polls `lsof -nP -i` and%s\n", dim, reset);
+    fprintf(e, "    %sdiffs snapshots, so short-lived connections may not be observed.%s\n\n", dim, reset);
+    fprintf(e, "  %sExamples:%s\n", bold, reset);
+    fprintf(e, "    %s# trace one PID's connections%s\n", dim, reset);
+    fprintf(e, "    tracep net %s-c -p%s 1234\n\n", green, reset);
+    fprintf(e, "    %s# trace a command's subtree%s\n", dim, reset);
+    fprintf(e, "    tracep net %s-c%s curl %shttps://example.com%s\n\n", green, reset, magenta, reset);
+    exit(1);
+}
+
+int net_main(int argc, char **argv) {
+    net_out = stdout;
+    // Force line buffering — output is otherwise block-buffered when stdout
+    // is a file/pipe, and we'd lose unflushed events on SIGTERM.
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    char **cmdArgs = NULL;
+    int    nCmdArgs = 0;
+    const char *outFile = NULL;
+    int nargs = argc - 1;
+    char **args = argv + 1;
+
+    for (int i = 0; i < nargs; i++) {
+        char *a = args[i];
+        if (strlen(a) < 2 || a[0] != '-') {
+            cmdArgs = &args[i];
+            nCmdArgs = nargs - i;
+            break;
+        }
+        for (char *pch = a + 1; *pch; pch++) {
+            char ch = *pch;
+            switch (ch) {
+            case 'c': net_colorForce = true; break;
+            case 'u': net_showUser   = true; break;
+            case 'Q': net_showErrors = false; break;
+            case 't': case 'U': case 'r': case '4': case '6': case 'O':
+                break; // Linux-only flags, accepted no-op on darwin
+            case 'p': {
+                if (i + 1 >= nargs) net_fatal("flag -p requires an argument");
+                i++;
+                char *dup = strdup(args[i]);
+                char *save = NULL;
+                for (char *s = strtok_r(dup, ",", &save); s; s = strtok_r(NULL, ",", &save)) {
+                    while (*s == ' ' || *s == '\t') s++;
+                    if (!*s) continue;
+                    long pid = strtol(s, NULL, 10);
+                    if (pid <= 0) net_fatalf("-p: invalid PID: %s", s);
+                    if (kill((pid_t)pid, 0) != 0 && errno == ESRCH)
+                        net_fatalf("-p %d: no such process", (int)pid);
+                    if (net_nWatchPIDs < (int)(sizeof net_watchPIDs / sizeof net_watchPIDs[0]))
+                        net_watchPIDs[net_nWatchPIDs++] = (int32_t)pid;
+                }
+                free(dup);
+                break;
+            }
+            case 'o':
+                if (i + 1 >= nargs) net_fatal("flag -o requires an argument");
+                i++;
+                outFile = args[i];
+                break;
+            case 'i': {
+                if (i + 1 >= nargs) net_fatal("flag -i requires an argument (poll interval ms)");
+                i++;
+                long v = strtol(args[i], NULL, 10);
+                if (v <= 0) net_fatalf("-i: invalid interval: %s", args[i]);
+                net_pollIntervalMs = (int)v;
+                break;
+            }
+            case 'h': net_usage(); break;
+            default: net_fatalf("unknown flag -%c", ch);
+            }
+        }
+    }
+
+    if (outFile && *outFile) {
+        FILE *f = fopen(outFile, "a");
+        if (!f) net_fatalf("open %s: %s", outFile, strerror(errno));
+        net_out = f;
+    }
+    if (net_colorForce) net_colorMode = true;
+    else if (!getenv("NO_COLOR")) net_colorMode = is_terminal(net_out);
+
+    // CMD mode: run the command and watch its pid.
+    if (nCmdArgs > 0) {
+        pid_t pid = fork();
+        if (pid < 0) net_fatalf("exec %s: %s", cmdArgs[0], strerror(errno));
+        if (pid == 0) {
+            char **cargv = malloc((size_t)(nCmdArgs + 1) * sizeof *cargv);
+            for (int k = 0; k < nCmdArgs; k++) cargv[k] = cmdArgs[k];
+            cargv[nCmdArgs] = NULL;
+            execvp(cargv[0], cargv);
+            fprintf(stderr, "tracep net: exec %s: %s\n", cmdArgs[0], strerror(errno));
+            _exit(1);
+        }
+        if (net_nWatchPIDs < (int)(sizeof net_watchPIDs / sizeof net_watchPIDs[0]))
+            net_watchPIDs[net_nWatchPIDs++] = (int32_t)pid;
+        // Reap silently in the background — when curl is done we just exit.
+        signal(SIGCHLD, SIG_IGN);
+    }
+
+    // Seed: mark currently-open sockets as already seen so we only print
+    // connections that appear AFTER tracep starts.
+    net_scan(true);
+
+    if (net_showErrors) {
+        const char *suffix = (geteuid() != 0)
+            ? "; non-root sees sockets only for own-user processes"
+            : "";
+        fprintf(stderr, "tracep net: polling at %dms on darwin — short-lived connections may be missed%s\n",
+                net_pollIntervalMs, suffix);
+    }
+
+    struct timespec ts = {
+        .tv_sec  = net_pollIntervalMs / 1000,
+        .tv_nsec = (long)(net_pollIntervalMs % 1000) * 1000000L,
+    };
+    for (;;) {
+        nanosleep(&ts, NULL);
+        net_scan(false);
+    }
+}
+
+#elif !defined(__linux__) // ── non-Linux, non-darwin stub ──────────────────────
 
 int net_main(int argc, char **argv) {
     (void)argc;
     (void)argv;
-#if defined(__APPLE__)
-    const char *os = "darwin";
-#elif defined(__FreeBSD__)
+#if defined(__FreeBSD__)
     const char *os = "freebsd";
 #elif defined(__OpenBSD__)
     const char *os = "openbsd";
@@ -35,7 +425,7 @@ int net_main(int argc, char **argv) {
     const char *os = "this platform";
 #endif
     fprintf(stderr,
-            "tracep net: network-connection tracing is only supported on Linux (this is %s).\n"
+            "tracep net: network-connection tracing is only supported on Linux and macOS (this is %s).\n"
             "Only `tracep ca` and `tracep dns` run on %s.\n",
             os, os);
     return 1;

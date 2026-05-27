@@ -24,7 +24,15 @@ gen_dns() {
   dig +short +time=2 github.com            >/dev/null 2>&1
   nslookup -timeout=2 cloudflare.com       >/dev/null 2>&1
 }
-gen_net() { curl -s -m 6 -o /dev/null http://example.com 2>/dev/null; }
+# Linux netlink catches even a single quick curl; macOS lsof polling
+# (default 1s) needs at least one connection to span a tick. Fire
+# several spaced curls so the live window definitely covers one.
+gen_net() {
+  for i in 1 2 3 4; do
+    curl -s -m 6 -o /dev/null http://example.com 2>/dev/null
+    sleep 0.3
+  done
+}
 gen_tls() { curl -s -m 6 -o /dev/null https://example.com 2>/dev/null; }
 # Linux netlink catches /bin/true and uname in microseconds; macOS polling
 # only sees processes that live longer than the poll interval (default 50ms),

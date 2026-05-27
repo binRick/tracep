@@ -396,8 +396,71 @@ static int cap_next(capture *c, const uint8_t **frame, int *len) {
     }
 }
 static void cap_close(capture *c) { if (c) { close(c->fd); free(c->buf); free(c); } }
+
+// macOS socket→PID via lsof — same approach as proc_darwin.go. One
+// `lsof -nP -iUDP -F pcn` scan fills a port→(pid, name) map; subsequent
+// lookups for any port within the 2-second TTL hit it for free. Non-root
+// callers see only own-user sockets (lsof limitation).
+typedef struct { int pid; char name[64]; } mac_pn;
+static mac_pn mac_udp[65536];
+static double mac_udp_born_ms;
+
+static void mac_scan_udp(void) {
+    memset(mac_udp, 0, sizeof mac_udp);
+    FILE *p = popen("/usr/sbin/lsof -nP -iUDP -F pcn 2>/dev/null", "r");
+    if (!p) return;
+    int  cur_pid = 0;
+    char cur_name[64] = "?";
+    char line[1024];
+    while (fgets(line, sizeof line, p)) {
+        size_t L = strlen(line);
+        while (L > 0 && (line[L - 1] == '\n' || line[L - 1] == '\r')) line[--L] = 0;
+        if (L < 2) continue;
+        switch (line[0]) {
+        case 'p': {
+            long v = strtol(line + 1, NULL, 10);
+            if (v > 0) cur_pid = (int)v;
+            break;
+        }
+        case 'c':
+            snprintf(cur_name, sizeof cur_name, "%s", line + 1);
+            break;
+        case 'n': {
+            // "n*:54321" or "n127.0.0.1:5353" or "n[::]:5353" or "n*:*"
+            const char *body = line + 1;
+            const char *colon = strrchr(body, ':');
+            if (!colon) break;
+            const char *pstr = colon + 1;
+            if (*pstr == '*') break;
+            // Strip "->host:port" connected suffix.
+            char buf[16];
+            size_t pl = 0;
+            for (; pstr[pl] && pstr[pl] != '-' && pl + 1 < sizeof buf; pl++)
+                buf[pl] = pstr[pl];
+            buf[pl] = 0;
+            long port = strtol(buf, NULL, 10);
+            if (port <= 0 || port > 65535) break;
+            mac_udp[port].pid = cur_pid;
+            snprintf(mac_udp[port].name, sizeof mac_udp[port].name, "%s", cur_name);
+            break;
+        }
+        }
+    }
+    pclose(p);
+}
+
 static int pid_for_udp_port(uint16_t port, char *name, int namecap) {
-    (void)port; snprintf(name, namecap, "?"); return 0;   // proc_other.go
+    double t = now_ms();
+    if (mac_udp_born_ms == 0 || t - mac_udp_born_ms > 2000.0) {
+        mac_scan_udp();
+        mac_udp_born_ms = t;
+    }
+    if (mac_udp[port].pid > 0) {
+        snprintf(name, namecap, "%s", mac_udp[port].name);
+        return mac_udp[port].pid;
+    }
+    snprintf(name, namecap, "?");
+    return 0;
 }
 #else
 struct capture { int unused; };
