@@ -22,6 +22,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pwd.h>
 #include <signal.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -157,7 +158,7 @@ static int lsof_argv(char **argv, int max) {
     argv[n++] = "-nP";
     argv[n++] = "-i";
     argv[n++] = "-F";
-    argv[n++] = "pcLPn";
+    argv[n++] = "pcLPnu"; // u = numeric uid, so -u can show the real owner
     if (net_nWatchPIDs > 0) {
         static char pidlist[2048];
         size_t w = 0;
@@ -168,6 +169,10 @@ static int lsof_argv(char **argv, int max) {
             w += (size_t)r;
         }
         pidlist[w] = 0;
+        // -a ANDs the -i (network) and -p (pid) selections. Without it lsof
+        // ORs its selection options, so `-i -p PID` lists *every* host socket
+        // (the -p is effectively ignored) and the per-PID filter is lost.
+        argv[n++] = "-a";
         argv[n++] = "-p";
         argv[n++] = pidlist;
     }
@@ -175,15 +180,45 @@ static int lsof_argv(char **argv, int max) {
     return n;
 }
 
-static void net_emit(int pid, const char *comm, const char *proto,
+// net_user_of resolves uid -> username into a static buffer (mirrors the Go
+// tracer's userOf), falling back to the numeric uid.
+static const char *net_user_of(uint32_t uid) {
+    static char buf[64];
+    struct passwd *pw = getpwuid((uid_t)uid);
+    if (pw && pw->pw_name) { snprintf(buf, sizeof buf, "%s", pw->pw_name); return buf; }
+    snprintf(buf, sizeof buf, "%u", uid);
+    return buf;
+}
+
+// CMD-mode child reaping: mirror the Go reference (cmd.Wait(); os.Exit(0))
+// so `tracep net CMD...` exits when the command finishes instead of polling
+// forever. The handler reaps and flags; the poll loop checks the flag.
+static volatile sig_atomic_t net_child_done;
+static pid_t                 net_child_pid;
+static void net_on_sigchld(int s) {
+    (void)s;
+    int st;
+    pid_t r;
+    while ((r = waitpid(-1, &st, WNOHANG)) > 0)
+        if (r == net_child_pid) net_child_done = 1;
+}
+
+static void net_emit(int pid, const char *comm, uint32_t uid, const char *proto,
                      const char *src, int sport,
                      const char *dst, int dport) {
     char buf[512];
     fprintf(net_out, "%7d ", pid);
     const char *cm = (comm && *comm) ? comm : "?";
-    char trimmed[16];
-    snprintf(trimmed, sizeof trimmed, "%-12.12s", cm);
+    char trimmed[32];
+    if (strlen(cm) > 12) snprintf(trimmed, sizeof trimmed, "%.11s…", cm); // 11 + ellipsis (matches Go)
+    else                 snprintf(trimmed, sizeof trimmed, "%-12s", cm);
     fprintf(net_out, "%s", net_c("96", trimmed));
+    if (net_showUser) {
+        char wrapped[80];
+        const char *u = net_user_of(uid);
+        snprintf(wrapped, sizeof wrapped, " <%s>", u);
+        fprintf(net_out, "%s", net_c(strcmp(u, "root") == 0 ? "91" : "92", wrapped));
+    }
     fputc(' ', net_out);
     snprintf(buf, sizeof buf, "%-4s", proto);
     fprintf(net_out, "%s ", net_c("2", buf));
@@ -221,7 +256,8 @@ static void net_scan(bool seedOnly) {
     FILE *r = fdopen(pipefd[0], "r");
     if (!r) { close(pipefd[0]); waitpid(pid, NULL, 0); return; }
 
-    int  cur_pid = 0;
+    int      cur_pid = 0;
+    uint32_t cur_uid = 0;
     char cur_comm[64] = "?";
     char cur_proto[8] = "";
     char line[4096];
@@ -232,10 +268,14 @@ static void net_scan(bool seedOnly) {
         switch (line[0]) {
         case 'p':
             cur_pid = atoi(line + 1);
-            cur_proto[0] = 0; // new process — clear stale per-fd state
+            cur_proto[0] = 0; // new process — clear stale per-process/fd state
+            cur_uid = 0;
             break;
         case 'c':
             snprintf(cur_comm, sizeof cur_comm, "%s", line + 1);
+            break;
+        case 'u':
+            cur_uid = (uint32_t)strtoul(line + 1, NULL, 10);
             break;
         case 'f':
             cur_proto[0] = 0; // new fd — clear so non-network fds are skipped
@@ -254,10 +294,11 @@ static void net_scan(bool seedOnly) {
             split_conn(body, src, sizeof src, dst, sizeof dst);
             split_host_port(src, sip, sizeof sip, &sport);
             split_host_port(dst, dip, sizeof dip, &dport);
+            if (sport == 0 && dport == 0) break; // unbound/listening (*:*) — match Go
             uint32_t h = net_hash(cur_proto, cur_pid, sip, sport, dip, dport);
             bool already = net_seen_check_insert(h, cur_pid, cur_proto, sip, sport, dip, dport);
             if (already || seedOnly) break;
-            net_emit(cur_pid, cur_comm, cur_proto, sip, sport, dip, dport);
+            net_emit(cur_pid, cur_comm, cur_uid, cur_proto, sip, sport, dip, dport);
             break;
         }
         }
@@ -284,8 +325,8 @@ static void net_usage(void) {
     fprintf(e, "    🎨  %s-c%s          colorize output\n", yellow, reset);
     fprintf(e, "    ⏲️   %s-i%s %sMS%s        poll interval in ms %s(default 1000)%s\n", yellow, reset, cyan, reset, dim, reset);
     fprintf(e, "    📝  %s-o%s %sFILE%s      log output to FILE\n", yellow, reset, cyan, reset);
-    fprintf(e, "    🎯  %s-p%s %sPID%s       filter to descendants of PID\n", yellow, reset, cyan, reset);
-    fprintf(e, "    👤  %s-u%s          print owning user (informational only)\n", yellow, reset);
+    fprintf(e, "    🎯  %s-p%s %sPID%s       watch only PID's own connections\n", yellow, reset, cyan, reset);
+    fprintf(e, "    👤  %s-u%s          print owning user\n", yellow, reset);
     fprintf(e, "    🔇  %s-Q%s          suppress error messages\n", yellow, reset);
     fprintf(e, "    %s-t/-U/-r/-4/-6/-O recognized for Linux compatibility (no-op on darwin)%s\n", dim, reset);
     fprintf(e, "\n  %sNotes:%s\n", bold, reset);
@@ -333,8 +374,13 @@ int net_main(int argc, char **argv) {
                 for (char *s = strtok_r(dup, ",", &save); s; s = strtok_r(NULL, ",", &save)) {
                     while (*s == ' ' || *s == '\t') s++;
                     if (!*s) continue;
-                    long pid = strtol(s, NULL, 10);
-                    if (pid <= 0) net_fatalf("-p: invalid PID: %s", s);
+                    char *end;
+                    errno = 0;
+                    long pid = strtol(s, &end, 10);
+                    // Reject trailing junk ("12abc") to match Go's strconv.Atoi;
+                    // otherwise it would silently target a truncated wrong PID.
+                    if (end == s || *end != 0 || errno != 0 || pid <= 0)
+                        net_fatalf("-p: invalid PID: %s", s);
                     if (kill((pid_t)pid, 0) != 0 && errno == ESRCH)
                         net_fatalf("-p %d: no such process", (int)pid);
                     if (net_nWatchPIDs < (int)(sizeof net_watchPIDs / sizeof net_watchPIDs[0]))
@@ -366,6 +412,11 @@ int net_main(int argc, char **argv) {
         FILE *f = fopen(outFile, "a");
         if (!f) net_fatalf("open %s: %s", outFile, strerror(errno));
         net_out = f;
+        // The setvbuf above line-buffers stdout; a freshly fopen'd file is
+        // block-buffered, so without this its low-volume output (e.g. -p PID)
+        // would be lost on signal termination (no SIGTERM flush). Mirrors
+        // exec_main; net_emit has no per-event fflush like dns.c/tls.c.
+        setvbuf(net_out, NULL, _IOLBF, 0);
     }
     if (net_colorForce) net_colorMode = true;
     else if (!getenv("NO_COLOR")) net_colorMode = is_terminal(net_out);
@@ -384,8 +435,16 @@ int net_main(int argc, char **argv) {
         }
         if (net_nWatchPIDs < (int)(sizeof net_watchPIDs / sizeof net_watchPIDs[0]))
             net_watchPIDs[net_nWatchPIDs++] = (int32_t)pid;
-        // Reap silently in the background — when curl is done we just exit.
-        signal(SIGCHLD, SIG_IGN);
+        // Reap the child and exit when it finishes, mirroring the Go
+        // reference (cmd.Wait(); os.Exit(0)). SIG_IGN alone would only
+        // auto-reap and the poll loop would otherwise run forever.
+        net_child_pid = pid;
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_handler = net_on_sigchld;
+        sigemptyset(&sa.sa_mask);
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGCHLD, &sa, NULL);
     }
 
     // Seed: mark currently-open sockets as already seen so we only print
@@ -407,6 +466,9 @@ int net_main(int argc, char **argv) {
     for (;;) {
         nanosleep(&ts, NULL);
         net_scan(false);
+        // CMD mode: once the launched command has exited, do a final scan
+        // to catch its last connections, then exit like the Go reference.
+        if (net_child_done) { net_scan(false); exit(0); }
     }
 }
 

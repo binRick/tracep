@@ -87,8 +87,15 @@ func scanUDPSocketsDarwin() map[uint16]macPidName {
 		case 'c':
 			name = line[1:]
 		case 'n':
-			// Trailing token after the last ':' is the port (or "*").
+			// We want the LOCAL source port (DNS replies are matched by the
+			// query's source port). For a connected UDP socket lsof renders
+			// "local:sport->remote:dport", so cut at "->" FIRST — otherwise
+			// the last ':' lands in the remote ":dport" (e.g. ":53") and we'd
+			// key the map by the server port and drop the real source port.
 			body := line[1:]
+			if arrow := strings.Index(body, "->"); arrow >= 0 {
+				body = body[:arrow]
+			}
 			colon := strings.LastIndex(body, ":")
 			if colon < 0 {
 				continue
@@ -96,10 +103,6 @@ func scanUDPSocketsDarwin() map[uint16]macPidName {
 			pstr := body[colon+1:]
 			if pstr == "*" {
 				continue // socket with no bound local port
-			}
-			// Strip a trailing "->host:port" suffix on connected sockets.
-			if arrow := strings.Index(pstr, "->"); arrow >= 0 {
-				pstr = pstr[:arrow]
 			}
 			p, err := strconv.Atoi(pstr)
 			if err != nil || p <= 0 || p > 65535 {

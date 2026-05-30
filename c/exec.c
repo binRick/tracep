@@ -904,6 +904,10 @@ int exec_main(int argc, char **argv) {
         out = f;
     }
 
+    // Line-buffer output (see macOS exec_main): a block-buffered pipe/file
+    // can lose low-volume output when the tracer is signal-terminated.
+    setvbuf(out, NULL, _IOLBF, 0);
+
     // Auto-detect color: on when out is a tty and NO_COLOR is unset.
     if (colorForce) {
         colorMode = true;
@@ -1132,17 +1136,23 @@ static int procListAllPIDs(int32_t **out_pids) {
     return n / 4;
 }
 
-// bsdInfo reads proc_bsdinfo for pid. Returns false if the process is
-// gone or unreadable (e.g. denied to non-root for some processes).
+// bsdInfo reads ppid, uid and start time for pid via the KERN_PROC_PID
+// sysctl. We use sysctl rather than proc_pidinfo(PROC_PIDTBSDINFO): the
+// kernel denies that call to non-root callers for processes they don't own,
+// which broke the system-wide ancestry walk for user processes parented by
+// a root process (e.g. a login/sshd-spawned shell). sysctl exposes this
+// basic info for every process. Returns false if the process is gone
+// (sysctl error / short read).
 static bool bsdInfo(int32_t pid, int32_t *ppid, uint32_t *uid,
                     uint64_t *startSec, uint64_t *startUsec) {
-    struct proc_bsdinfo bi;
-    int n = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof bi);
-    if (n < (int)sizeof bi) return false;
-    *ppid      = (int32_t)bi.pbi_ppid;
-    *uid       = bi.pbi_uid;
-    *startSec  = bi.pbi_start_tvsec;
-    *startUsec = bi.pbi_start_tvusec;
+    struct kinfo_proc kp;
+    size_t len = sizeof kp;
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid };
+    if (sysctl(mib, 4, &kp, &len, NULL, 0) != 0 || len == 0) return false;
+    *ppid      = (int32_t)kp.kp_eproc.e_ppid;
+    *uid       = kp.kp_eproc.e_ucred.cr_uid;
+    *startSec  = (uint64_t)kp.kp_proc.p_un.__p_starttime.tv_sec;
+    *startUsec = (uint64_t)kp.kp_proc.p_un.__p_starttime.tv_usec;
     return true;
 }
 
@@ -1652,6 +1662,12 @@ int exec_main(int argc, char **argv) {
         if (!f) fatalf("open %s: %s", outFile, strerror(errno));
         out = f;
     }
+    // Line-buffer output: when stdout is a pipe/file it is block-buffered by
+    // default, so low-volume streams (e.g. `-p PID`) sit unflushed and are
+    // lost when we're terminated by a signal. net.c/dns.c/tls.c already do
+    // this; exec did not. (Go's os.Stdout is unbuffered, so the Go tracer
+    // never needed it.)
+    setvbuf(out, NULL, _IOLBF, 0);
     if (colorForce) colorMode = true;
     else if (getenv("NO_COLOR") == NULL) colorMode = is_terminal(out);
 

@@ -525,20 +525,20 @@ only dispatches.
 
 | Language | Files | Lines | Blanks | Comments | Code | Complexity |
 |---|---|---|---|---|---|---|
-| Go | 20 | 5,502 | 582 | 477 | 4,443 | 1,190 |
+| Go | 20 | 5,547 | 583 | 510 | 4,454 | 1,195 |
 | Shell | 11 | 591 | 68 | 111 | 412 | 104 |
-| C | 7 | 5,948 | 571 | 424 | 4,953 | 1,641 |
+| C | 7 | 6,039 | 574 | 467 | 4,998 | 1,676 |
 | Makefile | 2 | 137 | 22 | 30 | 85 | 7 |
 | Markdown | 2 | 550 | 114 | 0 | 436 | 0 |
 | C Header | 1 | 46 | 8 | 20 | 18 | 0 |
 | Python | 1 | 23 | 3 | 4 | 16 | 3 |
 | YAML | 1 | 24 | 0 | 2 | 22 | 0 |
-| **Total** | **45** | **12,821** | **1,368** | **1,068** | **10,385** | **2,945** |
+| **Total** | **45** | **12,957** | **1,372** | **1,144** | **10,441** | **2,985** |
 
-- **Estimated Cost to Develop (organic):** $315,371
-- **Estimated Schedule Effort (organic):** 8.87 months
-- **Estimated People Required (organic):** 3.16
-- **Processed:** 430,764 bytes (0.431 megabytes)
+- **Estimated Cost to Develop (organic):** $317,157
+- **Estimated Schedule Effort (organic):** 8.89 months
+- **Estimated People Required (organic):** 3.17
+- **Processed:** 438,795 bytes (0.439 megabytes)
 
-*Generated with [scc](https://github.com/boyter/scc) on 2026-05-26*
+*Generated with [scc](https://github.com/boyter/scc) on 2026-05-29*
 <!-- scc-end -->

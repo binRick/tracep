@@ -1,11 +1,14 @@
 //go:build darwin
 
 // macOS exec tracer — polls proc_listallpids() and diffs against the
-// previous snapshot to detect new processes, pid reuse (start_time
-// changed) and in-place exec() (argv[0] changed for the same pid+start).
-// Short-lived processes that fork+exec+exit inside one poll interval
-// are missed; there is no Apple-supported event stream for exec()
-// without the EndpointSecurity entitlement.
+// previous snapshot to detect newly-started processes (a pid absent from
+// the prior snapshot) and exits (a pid that vanished). A known pid is
+// trusted to be the same process until it disappears, so in-place exec()
+// (a process exec()ing a new image without forking, keeping its pid) and
+// pid reuse within a poll window are NOT detected. Short-lived processes
+// that fork+exec+exit inside one poll interval are also missed; there is
+// no Apple-supported event stream for exec() without the EndpointSecurity
+// entitlement.
 //
 // Pure stdlib — calls Apple's proc_info syscall (SYS_PROC_INFO = 336)
 // directly via syscall.Syscall6 so the binary still cross-compiles from
@@ -52,6 +55,21 @@ const (
 	ctlKern        = 1
 	kernArgmax     = 8
 	kernProcArgs2  = 49
+	kernProc       = 14
+	kernProcPID    = 1
+
+	// Field offsets within struct kinfo_proc (from offsetof on this ABI;
+	// stable across darwin/arm64 + darwin/amd64, both LP64 little-endian).
+	// KERN_PROC_PID is used instead of proc_pidinfo(PROC_PIDTBSDINFO) for
+	// ancestry because sysctl exposes ppid/uid for *every* process, while
+	// proc_pidinfo denies them to non-root callers for processes they don't
+	// own — which otherwise breaks the system-wide walk for user processes
+	// parented by a root process (e.g. a login/sshd-spawned shell).
+	kinfoProcMinSize = 564 // need bytes up to e_ppid (560) + 4
+	kpOffStartSec    = 0   // kp_proc.p_un.__p_starttime.tv_sec  (8 bytes)
+	kpOffStartUsec   = 8   // kp_proc.p_un.__p_starttime.tv_usec (4 bytes)
+	kpOffUID         = 420 // kp_eproc.e_ucred.cr_uid            (4 bytes)
+	kpOffPPID        = 560 // kp_eproc.e_ppid                    (4 bytes)
 )
 
 // ─── Global options (mirror exec_linux.go) ───────────────────────────────────
@@ -83,7 +101,7 @@ type macEntry struct {
 	uid       uint32
 	startSec  uint64
 	startUsec uint64
-	argv0     string // for in-place exec detection (compare next tick)
+	argv0     string // remembered for the exit line (-t); not re-compared per tick
 	depth     int
 }
 
@@ -169,18 +187,23 @@ func procPIDInfo(pid int32, flavor int, buf []byte) (int, error) {
 	return int(n), nil
 }
 
-// bsdInfo reads proc_bsdinfo for pid. Returns false if the process is
-// gone (ESRCH) or otherwise unreadable.
+// bsdInfo reads ppid, uid and start time for pid via the KERN_PROC_PID
+// sysctl. We deliberately use sysctl rather than proc_pidinfo: the kernel
+// denies proc_pidinfo(PROC_PIDTBSDINFO) to non-root callers for processes
+// they don't own, which broke the system-wide ancestry walk for any user
+// process whose parent chain to launchd passes through a root-owned
+// process (a login/sshd-spawned shell). sysctl exposes this basic info for
+// every process. Returns false if the process is gone (sysctl error / short
+// read).
 func bsdInfo(pid int32) (ppid int32, uid uint32, startSec, startUsec uint64, ok bool) {
-	buf := make([]byte, procPIDTBSDInfoSize)
-	n, err := procPIDInfo(pid, procPIDTBSDInfo, buf)
-	if err != nil || n < procPIDTBSDInfoSize {
+	data, err := sysctlRaw([]int32{ctlKern, kernProc, kernProcPID, pid})
+	if err != nil || len(data) < kinfoProcMinSize {
 		return 0, 0, 0, 0, false
 	}
-	ppid = int32(binary.LittleEndian.Uint32(buf[16:20]))
-	uid = binary.LittleEndian.Uint32(buf[20:24])
-	startSec = binary.LittleEndian.Uint64(buf[120:128])
-	startUsec = binary.LittleEndian.Uint64(buf[128:136])
+	startSec = binary.LittleEndian.Uint64(data[kpOffStartSec : kpOffStartSec+8])
+	startUsec = uint64(binary.LittleEndian.Uint32(data[kpOffStartUsec : kpOffStartUsec+4]))
+	uid = binary.LittleEndian.Uint32(data[kpOffUID : kpOffUID+4])
+	ppid = int32(binary.LittleEndian.Uint32(data[kpOffPPID : kpOffPPID+4]))
 	ok = true
 	return
 }
