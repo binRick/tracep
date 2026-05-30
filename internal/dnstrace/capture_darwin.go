@@ -12,8 +12,9 @@ import (
 
 // macOS has no AF_PACKET. We use the BPF device (/dev/bpfN): bind it to a
 // real Ethernet interface, request immediate delivery, and parse the
-// bpf_hdr-framed records out of each read(). PID attribution is not
-// available off Linux (see proc_other.go) — queries are still shown.
+// bpf_hdr-framed records out of each read(). PID attribution on macOS is
+// provided by proc_darwin.go via an lsof UDP-port→PID map (own-user sockets
+// only when non-root); queries that can't be attributed are still shown.
 //
 // ioctl request numbers are computed the same way <sys/ioccom.h> does:
 //   _IOC(io, g, n, len) = io | ((len & 0x1fff) << 16) | (g << 8) | n
@@ -91,15 +92,23 @@ func openCapture() (*darwinCapture, error) {
 		return nil, err
 	}
 
-	var fd int
+	fd := -1
 	var openErr error
 	for i := 0; i < 256; i++ {
-		fd, openErr = syscall.Open(fmt.Sprintf("/dev/bpf%d", i), syscall.O_RDONLY, 0)
-		if openErr == nil {
+		f, e := syscall.Open(fmt.Sprintf("/dev/bpf%d", i), syscall.O_RDONLY, 0)
+		if e == nil {
+			fd, openErr = f, nil
 			break
 		}
+		// Report the real barrier: a permission error on the low-numbered
+		// nodes that actually exist, rather than the ENOENT we hit once we
+		// run past the highest /dev/bpfN that exists (which would otherwise
+		// mislead with "no such file or directory" on a non-root run).
+		if openErr == nil || e == syscall.EACCES || e == syscall.EPERM {
+			openErr = e
+		}
 	}
-	if openErr != nil {
+	if fd < 0 {
 		return nil, fmt.Errorf("open /dev/bpf*: %v\nHint: run with sudo", openErr)
 	}
 

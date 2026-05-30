@@ -105,17 +105,23 @@ func userOf(uid uint32) string {
 
 // ─── lsof scan ───────────────────────────────────────────────────────────────
 
-// lsofArgs builds the lsof command for this tick. -F pcPnTL emits one
-// field per line with stable codes; -nP suppresses DNS/service lookups
-// to keep output fast; -p limits to the watched PIDs when given.
+// lsofArgs builds the lsof command for this tick. -F pcLPnu emits one
+// field per line with stable codes (p pid, c command, L login, u uid,
+// P protocol, n name); -nP suppresses DNS/service lookups to keep output
+// fast; -p limits to the watched PIDs when given. The 'u' field is what
+// lets -u report the real owner — without it curUID stays 0 and every
+// connection mislabels as <root>.
 func lsofArgs() []string {
-	a := []string{"-nP", "-i", "-F", "pcLPn"}
+	a := []string{"-nP", "-i", "-F", "pcLPnu"}
 	if len(watchPIDs) > 0 {
 		ps := make([]string, 0, len(watchPIDs))
 		for _, p := range watchPIDs {
 			ps = append(ps, strconv.Itoa(int(p)))
 		}
-		a = append(a, "-p", strings.Join(ps, ","))
+		// -a ANDs the -i (network) and -p (pid) selections. Without it lsof
+		// ORs its selection options, so `-i -p PID` lists *every* host socket
+		// (the -p is effectively ignored) and the per-PID filter is lost.
+		a = append(a, "-a", "-p", strings.Join(ps, ","))
 	}
 	return a
 }
@@ -156,9 +162,10 @@ func scanConns() {
 			if v, err := strconv.Atoi(line[1:]); err == nil {
 				curPID = v
 			}
-			// New process record — reset per-fd state so a stale 'P' from
-			// a previous process can't leak into the next process's parse.
+			// New process record — reset per-process/fd state so a stale 'P'
+			// or 'u' from a previous process can't leak into the next one.
 			curProto = ""
+			curUID = 0
 		case 'c':
 			curComm = line[1:]
 		case 'L':
@@ -478,7 +485,7 @@ func usage() {
 	fmt.Fprintf(e, "    🎨  %s-c%s          colorize output\n", yellow, reset)
 	fmt.Fprintf(e, "    ⏲️   %s-i%s %sMS%s        poll interval in ms %s(default 1000)%s\n", yellow, reset, cyan, reset, dim, reset)
 	fmt.Fprintf(e, "    📝  %s-o%s %sFILE%s      log output to FILE\n", yellow, reset, cyan, reset)
-	fmt.Fprintf(e, "    🎯  %s-p%s %sPID%s       filter to descendants of PID\n", yellow, reset, cyan, reset)
+	fmt.Fprintf(e, "    🎯  %s-p%s %sPID%s       watch only PID's own connections\n", yellow, reset, cyan, reset)
 	fmt.Fprintf(e, "    👤  %s-u%s          print owning user\n", yellow, reset)
 	fmt.Fprintf(e, "    🔇  %s-Q%s          suppress error messages\n", yellow, reset)
 	fmt.Fprintf(e, "    %s-t/-U/-r/-4/-6/-O%s recognized for Linux compatibility (no-op on darwin)\n", dim, reset)

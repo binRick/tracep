@@ -1,10 +1,13 @@
-// proc-trace-dns — watch DNS queries made by every process on a Linux system.
+// proc-trace-dns — watch DNS queries made by every process on the system.
 //
-// It opens a raw AF_PACKET socket, captures UDP port-53 traffic system-wide,
-// parses the DNS wire format, and attributes each query to the process that
-// made it via /proc/net/udp socket→inode→PID resolution.
+// It opens a raw packet-capture device (AF_PACKET on Linux, /dev/bpf on
+// macOS), captures UDP port-53 traffic system-wide, parses the DNS wire
+// format, and attributes each query to the process that made it — via
+// /proc/net/udp socket→inode→PID on Linux (capture_linux.go/proc_linux.go)
+// and via an lsof UDP-port→PID map on macOS (capture_darwin.go/proc_darwin.go).
 //
-// Requires: root or CAP_NET_RAW.  Linux only.  No external dependencies.
+// Requires: root or CAP_NET_RAW (Linux) / sudo for /dev/bpf (macOS). No
+// external dependencies.
 package dnstrace
 
 import (
@@ -123,7 +126,7 @@ func Main() {
 		ex("sudo proc-trace-dns -t -n firefox",                    "timestamped Firefox queries")
 		ex("sudo proc-trace-dns -j | jq .",                        "JSON output, pretty-printed")
 		ex("sudo proc-trace-dns -- curl https://example.com",      "trace a single command")
-		fmt.Fprintf(os.Stderr, "\n%s%sRequires root or CAP_NET_RAW. Linux only.%s\n\n", e("⚠️ "), dim, reset)
+		fmt.Fprintf(os.Stderr, "\n%s%sRequires root or CAP_NET_RAW (Linux) / sudo (macOS).%s\n\n", e("⚠️ "), dim, reset)
 	}
 	fs.Parse(os.Args[1:])
 

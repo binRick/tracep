@@ -2,9 +2,11 @@
 //
 // Opens the platform packet-capture device (Linux AF_PACKET / macOS
 // /dev/bpf), parses DNS on the wire, matches each response to its request
-// to compute latency, and attributes the query to the owning process via
-// /proc (Linux only — off Linux there is no portable socket→PID map, so
-// pid 0 / name "?" is shown, exactly like the Go version).
+// to compute latency, and attributes the query to the owning process: via
+// /proc on Linux, and via an lsof UDP-port→PID map on macOS (see
+// mac_scan_udp below; parity with internal/dnstrace/proc_darwin.go). Queries
+// that can't be attributed (e.g. non-root, other-user sockets) show pid 0 /
+// name "?".
 #define _GNU_SOURCE
 #include "common.h"
 
@@ -69,7 +71,10 @@ static void parse_pids(const char *s) {
     char *dup = strdup(s ? s : ""), *save = NULL;
     for (char *t = strtok_r(dup, ",", &save); t; t = strtok_r(NULL, ",", &save)) {
         char *e; long v = strtol(t, &e, 10);
-        if (e != t && pid_n < MAX_SET) pid_set[pid_n++] = (int)v;
+        while (*e == ' ' || *e == '\t') e++; // allow trailing space (Go TrimSpace)
+        // Require a fully-numeric token: reject "12abc" like Go's strconv.Atoi
+        // (which otherwise truncates to 12 here — a silent wrong filter entry).
+        if (e != t && *e == 0 && pid_n < MAX_SET) pid_set[pid_n++] = (int)v;
     }
     free(dup);
 }
@@ -307,7 +312,8 @@ static int pid_for_udp_port(uint16_t port, char *name, int namecap) {
 #elif defined(__APPLE__)
 // macOS has no AF_PACKET. Use /dev/bpfN bound to a real Ethernet interface
 // with immediate delivery, and walk the bpf_hdr-framed records out of each
-// read(). No socket→PID map off Linux (proc_other.go) — pid 0, name "?".
+// read(). Process attribution is done separately via lsof (see
+// mac_scan_udp below; parity with internal/dnstrace/proc_darwin.go).
 #include <fcntl.h>
 #include <ifaddrs.h>
 #include <net/bpf.h>
@@ -346,13 +352,16 @@ static capture *cap_open(char *errbuf, size_t errsz) {
         snprintf(errbuf, errsz, "no up non-loopback IPv4 interface found");
         return NULL;
     }
-    int fd = -1;
+    int fd = -1, openErrno = 0;
     for (int i = 0; i < 256; i++) {
         char dev[16]; snprintf(dev, sizeof dev, "/dev/bpf%d", i);
         fd = open(dev, O_RDONLY);
         if (fd >= 0) break;
+        // Report the real barrier: permission denied on the low-numbered
+        // nodes that exist, not the ENOENT past the highest /dev/bpfN.
+        if (openErrno == 0 || errno == EACCES || errno == EPERM) openErrno = errno;
     }
-    if (fd < 0) { snprintf(errbuf, errsz, "open /dev/bpf*: %s\nHint: run with sudo", strerror(errno)); return NULL; }
+    if (fd < 0) { snprintf(errbuf, errsz, "open /dev/bpf*: %s\nHint: run with sudo", strerror(openErrno)); return NULL; }
 
     u_int blen = 32768;
     if (ioctl(fd, BIOCSBLEN, &blen) < 0) { snprintf(errbuf, errsz, "BIOCSBLEN: %s", strerror(errno)); close(fd); return NULL; }
@@ -418,27 +427,31 @@ static void mac_scan_udp(void) {
         if (L < 2) continue;
         switch (line[0]) {
         case 'p': {
-            long v = strtol(line + 1, NULL, 10);
-            if (v > 0) cur_pid = (int)v;
+            char *e; long v = strtol(line + 1, &e, 10);
+            // Accept any fully-numeric pid incl 0 (matches Go's strconv.Atoi);
+            // the old `if (v>0)` skipped a p0 record and carried the prior
+            // pid forward, mis-attributing its ports.
+            if (e != line + 1 && *e == 0) cur_pid = (int)v;
             break;
         }
         case 'c':
             snprintf(cur_name, sizeof cur_name, "%s", line + 1);
             break;
         case 'n': {
-            // "n*:54321" or "n127.0.0.1:5353" or "n[::]:5353" or "n*:*"
-            const char *body = line + 1;
+            // "n*:54321" or "n127.0.0.1:5353" or "n[::]:5353" or "n*:*" or a
+            // connected "local:sport->remote:dport". We want the LOCAL source
+            // port (replies are matched by it), so cut at "->" FIRST —
+            // otherwise strrchr(':') lands on the remote ":dport" (e.g. ":53")
+            // and we'd key the map by the server port and lose attribution.
+            char body[256];
+            snprintf(body, sizeof body, "%s", line + 1);
+            char *arrow = strstr(body, "->");
+            if (arrow) *arrow = 0;
             const char *colon = strrchr(body, ':');
             if (!colon) break;
             const char *pstr = colon + 1;
             if (*pstr == '*') break;
-            // Strip "->host:port" connected suffix.
-            char buf[16];
-            size_t pl = 0;
-            for (; pstr[pl] && pstr[pl] != '-' && pl + 1 < sizeof buf; pl++)
-                buf[pl] = pstr[pl];
-            buf[pl] = 0;
-            long port = strtol(buf, NULL, 10);
+            long port = strtol(pstr, NULL, 10);
             if (port <= 0 || port > 65535) break;
             mac_udp[port].pid = cur_pid;
             snprintf(mac_udp[port].name, sizeof mac_udp[port].name, "%s", cur_name);
